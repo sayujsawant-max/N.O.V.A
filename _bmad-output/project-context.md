@@ -33,6 +33,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 ### Python Language Rules
 
 - **Type annotations on everything.** All function signatures, return types, class attributes. Use `X | None` union syntax (3.12+), not `Optional[X]`. Use `list[str]` not `List[str]`.
+- **Type aliases use PEP 695 `type` keyword, not `typing.TypeAlias`.** `type SqlParams = Sequence[str | int | float | bytes | None]`, never `SqlParams: TypeAlias = ...`. ruff `UP040` enforces this on the py312 target. Convention established in Story 1.4 (first type alias in the codebase). Applies to both public and module-private (leading-underscore) aliases.
 - **asyncio is the concurrency model.** Single event loop, async/await throughout. No threads, no multiprocessing, no `concurrent.futures` unless explicitly required for a blocking Win32 call (and then wrapped in `asyncio.to_thread()`).
 - **Dataclasses for all domain types.** Use `@dataclass(frozen=True)` for immutable value objects (events, view models, config). Mutable dataclasses only where mutation is the explicit design.
 - **No raw string event types.** All events are typed classes in `core/events.py`. Never dispatch or listen for a string event name.
@@ -42,6 +43,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - **Imports: absolute only.** `from nova.systems.brain.models import SessionSummary` — never relative imports between systems.
 - **No `print()` anywhere.** Terminal output goes through Skin. Debugging goes through `logging`. These channels are strictly separated.
 - **Timezone-aware datetimes only.** Use UTC-aware `datetime` in system and storage code. Localize to user timezone only at the rendering layer (Skin). Never mix naive and aware datetimes.
+- **Timestamp helpers use the two-function clock pattern.** Story 1.3 pinned `_utc_now_iso()` (canonical, `datetime.now(UTC).isoformat()`) + `_default_timestamp()` (factory indirection whose body is `return _utc_now_iso()`). Tests monkeypatch `_utc_now_iso` for determinism; the indirection keeps the patch effective across every new instance. **Any future timestamp-emitting module — migration runner `schema_version.applied_at` (Story 1.5), AuditLogger `audit_log.timestamp` (Story 1.8), Brain `sessions.started_at` / `memory_items.created_at` (Story 3.1+) — MUST reuse this pattern** (either by importing `_utc_now_iso` from `nova.core.events` or by declaring a matching two-function pair in the owning module). Never inline `datetime.now(UTC).isoformat()` at the call site — that forecloses deterministic testing.
 - **No `Any` in application code.** Restrict `Any` to third-party integration boundaries and narrow immediately. Prefer precise types, `TypedDict`, `Protocol`, dataclasses, or `Literal`/`Enum`.
 - **Typed boundary parsing required.** External payloads (Anthropic API responses, Win32 adapter outputs, JSON blobs from SQLite) must be parsed into typed DTOs/domain models before entering system logic. Never pass raw `dict[str, object]` through the system.
 - **Never swallow `asyncio.CancelledError`.** Cleanup is allowed, but cancellation must always be re-raised.

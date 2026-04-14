@@ -1,1 +1,5 @@
-"""SQLite storage engine and migration runner. Implementation in Stories 1.4-1.5."""
+"""SQLite storage engine and migration runner — infrastructure for Brain's persistence."""
+
+from nova.core.storage.engine import SqliteStorageEngine
+
+__all__: list[str] = ["SqliteStorageEngine"]

@@ -20,6 +20,7 @@ from nova.core.exceptions import (
     NovaError,
     StorageError,
 )
+from nova.core.storage import SqliteStorageEngine
 from nova.core.types import (
     ActionType,
     BluntnessLevel,
@@ -50,6 +51,7 @@ __all__: list[str] = [
     "SessionEnded",
     "SessionStarted",
     "SnapshotType",
+    "SqliteStorageEngine",
     "StorageError",
     "TierChanged",
 ]
