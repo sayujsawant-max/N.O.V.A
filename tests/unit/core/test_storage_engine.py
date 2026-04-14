@@ -692,3 +692,130 @@ async def test_concurrent_executes_serialize_correctly(tmp_path: Path) -> None:
         assert sorted(r["val"] for r in rows) == ["a", "b", "c"]
     finally:
         await engine.close()
+
+
+# --- Story 1.5: transaction() context manager ---------------------------------
+
+
+async def test_transaction_context_manager_commits_on_success(tmp_path: Path) -> None:
+    engine = SqliteStorageEngine(tmp_path / "tx.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (val TEXT)")
+        async with engine.transaction():
+            await engine.execute("INSERT INTO t (val) VALUES (?)", ("first",))
+            await engine.execute("INSERT INTO t (val) VALUES (?)", ("second",))
+        rows = await engine.fetchall("SELECT val FROM t ORDER BY rowid")
+        assert [r["val"] for r in rows] == ["first", "second"]
+    finally:
+        await engine.close()
+
+
+async def test_transaction_context_manager_rolls_back_on_exception(tmp_path: Path) -> None:
+    engine = SqliteStorageEngine(tmp_path / "tx.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (val TEXT)")
+        with pytest.raises(RuntimeError, match="boom"):
+            async with engine.transaction():
+                await engine.execute("INSERT INTO t (val) VALUES (?)", ("ghost",))
+                raise RuntimeError("boom")
+        rows = await engine.fetchall("SELECT val FROM t")
+        # ROLLBACK reverted the insert.
+        assert rows == []
+    finally:
+        await engine.close()
+
+
+async def test_transaction_rolls_back_on_cancellation(tmp_path: Path) -> None:
+    engine = SqliteStorageEngine(tmp_path / "tx.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (val TEXT)")
+
+        async def in_tx() -> None:
+            async with engine.transaction():
+                await engine.execute("INSERT INTO t (val) VALUES (?)", ("pending",))
+                # Simulate a long operation that gets cancelled mid-transaction.
+                await asyncio.sleep(10.0)
+
+        task = asyncio.create_task(in_tx())
+        await asyncio.sleep(0.05)  # let the task reach the sleep
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        rows = await engine.fetchall("SELECT val FROM t")
+        # ROLLBACK reverted the insert even under cancellation.
+        assert rows == []
+    finally:
+        await engine.close()
+
+
+async def test_nested_transaction_rejected(tmp_path: Path) -> None:
+    engine = SqliteStorageEngine(tmp_path / "tx.db")
+    await engine.start()
+    try:
+        with pytest.raises(StorageError, match="nested transaction"):
+            async with engine.transaction():
+                async with engine.transaction():
+                    pass
+    finally:
+        await engine.close()
+
+
+async def test_fetch_inside_transaction_sees_own_writes(tmp_path: Path) -> None:
+    engine = SqliteStorageEngine(tmp_path / "tx.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (val TEXT)")
+        async with engine.transaction():
+            await engine.execute("INSERT INTO t (val) VALUES (?)", ("read-me",))
+            row = await engine.fetchone("SELECT val FROM t")
+            assert row is not None
+            # Uncommitted write is visible to the same connection.
+            assert row["val"] == "read-me"
+    finally:
+        await engine.close()
+
+
+async def test_transaction_releases_lock_on_exception(tmp_path: Path) -> None:
+    engine = SqliteStorageEngine(tmp_path / "tx.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (val TEXT)")
+        with pytest.raises(RuntimeError, match="first"):
+            async with engine.transaction():
+                raise RuntimeError("first")
+        # Second transaction succeeds — lock was released.
+        async with engine.transaction():
+            await engine.execute("INSERT INTO t (val) VALUES (?)", ("second",))
+        rows = await engine.fetchall("SELECT val FROM t")
+        assert [r["val"] for r in rows] == ["second"]
+    finally:
+        await engine.close()
+
+
+# --- Story 1.5: run_migrations() delegator ------------------------------------
+
+
+async def test_run_migrations_requires_started(tmp_path: Path) -> None:
+    engine = SqliteStorageEngine(tmp_path / "test.db")
+    # Never-started engine — run_migrations must fire the guard before
+    # attempting any runner work.
+    with pytest.raises(StorageError, match="not started"):
+        await engine.run_migrations()
+
+
+async def test_run_migrations_delegates_to_runner(tmp_path: Path) -> None:
+    engine = SqliteStorageEngine(tmp_path / "delegate.db")
+    await engine.start()
+    try:
+        # Delegates to MigrationRunner against the default migrations package,
+        # which contains 001_initial_schema.py. First call applies [1]; second
+        # call is idempotent and returns [].
+        applied = await engine.run_migrations()
+        assert applied == [1]
+        applied_again = await engine.run_migrations()
+        assert applied_again == []
+    finally:
+        await engine.close()

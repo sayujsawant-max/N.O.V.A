@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-14 (Story 1.4: review → done after code review — 12 patches, 5 deferrals)
+# last_updated: 2026-04-14 (Story 1.5: review → done — code review 12 patches resolved, 342 tests pass)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -49,7 +49,7 @@ development_status:
   1-2-domain-exceptions-and-shared-types: done
   1-3-event-bus-and-typed-event-definitions: done
   1-4-sqlite-storage-engine: done
-  1-5-migration-runner-and-initial-schema: backlog
+  1-5-migration-runner-and-initial-schema: done
   1-6-config-loader-and-immutable-novaconfig: backlog
   1-7-capability-tier-state-machine: backlog
   1-8-audit-logger: backlog

@@ -32,6 +32,7 @@ import pytest
 import nova.core.events as events_module
 import nova.core.exceptions as exceptions_module
 import nova.core.storage.engine as storage_engine_module
+import nova.core.storage.migrations.runner as migration_runner_module
 import nova.core.types as types_module
 
 ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset({"enum", "__future__"})
@@ -100,6 +101,28 @@ STORAGE_ENGINE_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
         "pathlib",
         "sqlite3",
         "types",
+        "typing",
+    }
+)
+
+# `core/storage/migrations/runner.py` (Story 1.5) talks to the DB ONLY
+# through the storage engine — the full FORBIDDEN_TOPLEVEL_MODULES denylist
+# applies (including `sqlite3`). Allowlist below covers stdlib + the single
+# first-party `nova` segment for `nova.core.exceptions` /
+# `nova.core.storage.engine` imports.
+MIGRATION_RUNNER_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "importlib",
+        "inspect",
+        "logging",
+        "nova",
+        "pathlib",
+        "re",
+        "shutil",
         "typing",
     }
 )
@@ -197,7 +220,14 @@ def _dynamic_import_targets(tree: ast.AST) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    "module", [exceptions_module, types_module, events_module, storage_engine_module]
+    "module",
+    [
+        exceptions_module,
+        types_module,
+        events_module,
+        storage_engine_module,
+        migration_runner_module,
+    ],
 )
 def test_no_relative_imports(module: ModuleType) -> None:
     """Relative imports are forbidden in core (P1)."""
@@ -243,7 +273,14 @@ def test_enum_imports_use_public_symbols_only(module: ModuleType) -> None:
 
 
 @pytest.mark.parametrize(
-    "module", [exceptions_module, types_module, events_module, storage_engine_module]
+    "module",
+    [
+        exceptions_module,
+        types_module,
+        events_module,
+        storage_engine_module,
+        migration_runner_module,
+    ],
 )
 def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
     """`importlib.import_module(...)` and `__import__(...)` cannot reach adapters (P2).
@@ -251,7 +288,9 @@ def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
     For ``core/storage/engine.py`` this still blocks every adapter except
     ``sqlite3``; the dedicated
     ``test_storage_engine_forbidden_imports_minus_sqlite3`` guards the
-    narrower dynamic-import-minus-sqlite3 check.
+    narrower dynamic-import-minus-sqlite3 check. The migration runner
+    (Story 1.5) does NOT get the sqlite3 carve-out — it must use the
+    storage engine, never `sqlite3` directly.
     """
     tree = ast.parse(_read_module_source(module))
     targets = _dynamic_import_targets(tree)
@@ -405,6 +444,75 @@ def test_storage_engine_does_not_dynamically_import_nova_adapters_or_systems(
     module: ModuleType,
 ) -> None:
     """`importlib.import_module("nova.adapters.*")` must also be blocked from storage engine."""
+    tree = ast.parse(_read_module_source(module))
+    leaked = [
+        t
+        for t in _dynamic_import_full_targets(tree)
+        if _has_forbidden_prefix(t, FORBIDDEN_NOVA_PREFIXES)
+    ]
+    assert not leaked, (
+        f"Dynamic nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+# --- Migration runner (Story 1.5) isolation guards ---------------------------
+
+
+@pytest.mark.parametrize("module", [migration_runner_module])
+def test_migration_runner_forbidden_imports(module: ModuleType) -> None:
+    """`core/storage/migrations/runner.py` must NOT import any adapter directly.
+
+    Crucially, no `sqlite3` carve-out: the runner uses the engine for
+    every DB call. The full FORBIDDEN_TOPLEVEL_MODULES denylist applies.
+    """
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree)}
+    leaked = used & FORBIDDEN_TOPLEVEL_MODULES
+    assert not leaked, f"Forbidden adapter imports leaked into {module.__name__}: {sorted(leaked)}."
+
+
+@pytest.mark.parametrize("module", [migration_runner_module])
+def test_migration_runner_imports_within_allowlist(module: ModuleType) -> None:
+    """Migration runner has its own stdlib allowlist (no sqlite3, no asyncio)."""
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree) if m != RELATIVE_IMPORT_MARKER}
+    out_of_allowlist = used - MIGRATION_RUNNER_ALLOWED_TOPLEVEL_MODULES
+    assert not out_of_allowlist, (
+        f"Imports outside the migration-runner allowlist: {sorted(out_of_allowlist)}. "
+        f"Allowlist is {sorted(MIGRATION_RUNNER_ALLOWED_TOPLEVEL_MODULES)}."
+    )
+
+
+@pytest.mark.parametrize("module", [migration_runner_module])
+def test_migration_runner_does_not_import_nova_adapters_or_systems(
+    module: ModuleType,
+) -> None:
+    """Runner consumes the storage engine; it does not reach into adapters/systems/ports."""
+    tree = ast.parse(_read_module_source(module))
+    leaked: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            if _has_forbidden_prefix(node.module, FORBIDDEN_NOVA_PREFIXES):
+                leaked.append(node.module)
+                continue
+            for alias in node.names:
+                composed = f"{node.module}.{alias.name}"
+                if _has_forbidden_prefix(composed, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(composed)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _has_forbidden_prefix(alias.name, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(alias.name)
+    assert not leaked, (
+        f"Forbidden nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+@pytest.mark.parametrize("module", [migration_runner_module])
+def test_migration_runner_does_not_dynamically_import_nova_adapters_or_systems(
+    module: ModuleType,
+) -> None:
+    """`importlib.import_module("nova.adapters.*")` must also be blocked from the runner."""
     tree = ast.parse(_read_module_source(module))
     leaked = [
         t

@@ -49,8 +49,9 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import TracebackType
 from typing import cast
@@ -118,6 +119,14 @@ class SqliteStorageEngine:
         self._db_path: Path = db_path
         self._connection: sqlite3.Connection | None = None
         self._executor: ThreadPoolExecutor | None = None
+        # Story 1.5: transaction mutex + owning-task identity. asyncio.Lock
+        # in 3.10+ lazily binds to the running loop on first acquire, so
+        # constructing here (outside any loop) is safe. Tracking the owning
+        # asyncio.Task lets execute()/executemany() decide synchronously
+        # whether the caller is inside its own transaction (re-entrant via
+        # the same task) — a plain bool would race with concurrent tasks.
+        self._tx_lock: asyncio.Lock = asyncio.Lock()
+        self._tx_owner: asyncio.Task[object] | None = None
 
     async def __aenter__(self) -> SqliteStorageEngine:
         await self.start()
@@ -213,8 +222,123 @@ class SqliteStorageEngine:
         if pending_error is not None:
             raise pending_error
 
+    async def run_migrations(self) -> list[int]:
+        """Discover and apply pending migrations via MigrationRunner.
+
+        Thin delegator — exists so the composition root (Story 1.10) can
+        call ``await storage.run_migrations()`` matching architecture.md
+        line 1068. See
+        ``nova.core.storage.migrations.runner.MigrationRunner`` for the
+        full contract.
+        """
+        self._require_started()
+        try:
+            # Function-local import breaks the circular dependency:
+            # runner.py imports SqliteStorageEngine at module level.
+            from nova.core.storage.migrations.runner import MigrationRunner
+        except ImportError as err:
+            # A broken migrations sub-package must surface as StorageError so
+            # the composition-root contract (all persistence failures route
+            # through StorageError) holds.
+            raise StorageError("migration runner unavailable") from err
+
+        return await MigrationRunner(self).run()
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        """Multi-statement transaction context manager.
+
+        Inside the block, ``execute`` / ``executemany`` called from the same
+        asyncio task do NOT auto-commit — COMMIT fires on context exit;
+        ROLLBACK on any exception (including ``CancelledError``). Nested
+        transactions on the owning task are rejected with
+        ``StorageError("nested transaction")``.
+
+        Concurrency model: ``transaction()`` acquires ``self._tx_lock`` and
+        records ``self._tx_owner = asyncio.current_task()``. Any
+        ``execute``/``executemany`` call from a *different* task blocks on
+        ``self._tx_lock`` until the transaction completes — preventing
+        the auto-commit-of-foreign-transaction race. Calls from the
+        *owning* task short-circuit the lock acquisition (asyncio.Lock is
+        not reentrant) and use the no-commit dispatch path.
+
+        Story 1.5 added this primitive specifically so the migration runner
+        can keep DDL + the ``schema_version`` insert in one atomic unit;
+        Story 1.4's per-statement auto-commit shape made multi-statement
+        atomicity via ``execute()`` impossible.
+        """
+        self._require_started()
+        current = asyncio.current_task()
+        if self._tx_owner is current and current is not None:
+            raise StorageError("nested transaction")
+        async with self._tx_lock:
+            assert self._connection is not None
+            assert self._executor is not None
+            conn = self._connection
+            executor = self._executor
+            loop = asyncio.get_running_loop()
+            try:
+                await loop.run_in_executor(
+                    executor, self._execute_sync_no_commit, conn, "BEGIN IMMEDIATE", ()
+                )
+            except (sqlite3.Error, sqlite3.Warning, RuntimeError) as err:
+                raise StorageError("transaction begin failed") from err
+            self._tx_owner = current
+            try:
+                try:
+                    yield
+                except BaseException:
+                    # ROLLBACK best-effort. asyncio.shield prevents an outer
+                    # cancellation from interrupting the rollback — without
+                    # shield, a CancelledError during the await would replace
+                    # the original exception and abandon the rollback on the
+                    # worker thread mid-flight. suppress(BaseException) here
+                    # so the shielded ROLLBACK's own CancelledError doesn't
+                    # mask the original failure either.
+                    with contextlib.suppress(BaseException):
+                        await asyncio.shield(
+                            loop.run_in_executor(
+                                executor,
+                                self._execute_sync_no_commit,
+                                conn,
+                                "ROLLBACK",
+                                (),
+                            )
+                        )
+                    raise
+                else:
+                    try:
+                        await loop.run_in_executor(
+                            executor, self._execute_sync_no_commit, conn, "COMMIT", ()
+                        )
+                    except (sqlite3.Error, sqlite3.Warning, RuntimeError) as err:
+                        # COMMIT failed — attempt rollback best-effort, then
+                        # surface as StorageError per the engine boundary
+                        # contract.
+                        with contextlib.suppress(BaseException):
+                            await asyncio.shield(
+                                loop.run_in_executor(
+                                    executor,
+                                    self._execute_sync_no_commit,
+                                    conn,
+                                    "ROLLBACK",
+                                    (),
+                                )
+                            )
+                        raise StorageError("transaction commit failed") from err
+            finally:
+                self._tx_owner = None
+
     async def execute(self, sql: str, params: SqlParams = ()) -> None:
-        """Run a single write (INSERT/UPDATE/DELETE/DDL) and commit."""
+        """Run a single write (INSERT/UPDATE/DELETE/DDL) and commit.
+
+        Inside an active ``transaction()`` block on the same asyncio task,
+        the per-statement commit is suppressed — COMMIT fires on
+        context-exit. Calls from a *different* task block on the
+        transaction lock until the active transaction completes; this
+        prevents the auto-commit from prematurely committing a foreign
+        transaction (the race that motivated the ``_tx_owner`` design).
+        """
         self._require_started()
         # mypy narrowing — _require_started raised above, asserts are load-bearing
         # for type checking only. The captured locals below defeat the
@@ -227,9 +351,23 @@ class SqliteStorageEngine:
 
         _reject_scalar_string_params(params)
         params_tuple: _SqlParamsTuple = tuple(params)
+        current = asyncio.current_task()
+        is_tx_owner = self._tx_owner is current and current is not None
+        loop = asyncio.get_running_loop()
         try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(executor, self._execute_sync, conn, sql, params_tuple)
+            if is_tx_owner:
+                # Same task as the active transaction — skip lock (asyncio.Lock
+                # is not reentrant) and use the no-commit path.
+                await loop.run_in_executor(
+                    executor, self._execute_sync_no_commit, conn, sql, params_tuple
+                )
+            else:
+                # Different task (or no active transaction) — acquire the lock
+                # so any in-flight transaction completes first, then auto-commit.
+                async with self._tx_lock:
+                    await loop.run_in_executor(
+                        executor, self._execute_sync, conn, sql, params_tuple
+                    )
         except (sqlite3.Error, sqlite3.Warning, RuntimeError) as err:
             raise StorageError("execute failed") from err
 
@@ -238,7 +376,8 @@ class SqliteStorageEngine:
 
         Materializes ``seq_of_params`` on the caller thread BEFORE
         dispatch — generators crossing into the worker thread are a
-        footgun sqlite3 does not protect against.
+        footgun sqlite3 does not protect against. Same task-identity
+        dispatch contract as :meth:`execute` — see its docstring.
         """
         self._require_started()
         assert self._connection is not None
@@ -260,9 +399,19 @@ class SqliteStorageEngine:
         for row in seq_of_params:
             _reject_scalar_string_params(row)
             seq_as_list.append(tuple(row))
+        current = asyncio.current_task()
+        is_tx_owner = self._tx_owner is current and current is not None
+        loop = asyncio.get_running_loop()
         try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(executor, self._executemany_sync, conn, sql, seq_as_list)
+            if is_tx_owner:
+                await loop.run_in_executor(
+                    executor, self._executemany_sync_no_commit, conn, sql, seq_as_list
+                )
+            else:
+                async with self._tx_lock:
+                    await loop.run_in_executor(
+                        executor, self._executemany_sync, conn, sql, seq_as_list
+                    )
         except (sqlite3.Error, sqlite3.Warning, RuntimeError) as err:
             raise StorageError("executemany failed") from err
 
@@ -386,12 +535,28 @@ class SqliteStorageEngine:
         conn.commit()
 
     @staticmethod
+    def _execute_sync_no_commit(
+        conn: sqlite3.Connection, sql: str, params: _SqlParamsTuple
+    ) -> None:
+        """Inside-transaction variant: execute without per-statement commit."""
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+
+    @staticmethod
     def _executemany_sync(
         conn: sqlite3.Connection, sql: str, seq_of_params_list: list[_SqlParamsTuple]
     ) -> None:
         cursor = conn.cursor()
         cursor.executemany(sql, seq_of_params_list)
         conn.commit()
+
+    @staticmethod
+    def _executemany_sync_no_commit(
+        conn: sqlite3.Connection, sql: str, seq_of_params_list: list[_SqlParamsTuple]
+    ) -> None:
+        """Inside-transaction variant: executemany without per-statement commit."""
+        cursor = conn.cursor()
+        cursor.executemany(sql, seq_of_params_list)
 
     @staticmethod
     def _fetchone_sync(
