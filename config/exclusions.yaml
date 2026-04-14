@@ -1,0 +1,38 @@
+# Sensitive-context exclusion list.
+#
+# Two lists, two matching semantics:
+#   - excluded_apps:         match[i] is tested against the window's process /
+#                            executable name (case-insensitive substring).
+#                            Use this for apps with STABLE process-name
+#                            signatures (password managers, specific vaults).
+#   - excluded_title_patterns: each string is tested against the window title
+#                            text (case-insensitive substring). Use this for
+#                            title/content concepts that don't have a stable
+#                            process name (banking, credit cards, etc.).
+#
+# When either list matches a captured window, Eyes emits an OPAQUE event:
+#   "A protected app was active"
+# No app name, no window title, no content enters storage, cloud prompts,
+# audit trail, or transparency display.
+#
+# Schema reference: docs/config-schemas.md#exclusions-schema
+# Runtime location: %LOCALAPPDATA%/nova/exclusions.yaml
+
+excluded_apps:
+  - name: 1Password               # Display only (for settings-UI listing).
+    match: 1password              # Case-insensitive substring on process name.
+  - name: KeePassXC
+    match: keepassxc
+  - name: Bitwarden
+    match: bitwarden
+
+# NOTE: "Banking" intentionally is NOT in excluded_apps. Banking is a
+# title/content concept, not a stable process signature. A broad `bank`
+# process-name match false-positives on unrelated executables. Banking
+# exclusion is expressed via excluded_title_patterns below.
+
+excluded_title_patterns:
+  - "password"
+  - "banking"
+  - "credit card"
+  - "account settings"

@@ -1,0 +1,32 @@
+# Shipped-default settings for N.O.V.A.
+#
+# This file is the fallback/default baseline. It is COPIED (not referenced)
+# into %LOCALAPPDATA%/nova/settings.yaml on first run. Subsequent runs read
+# the user's own settings.yaml; changes here do not affect existing users
+# unless explicit upgrade logic copies them.
+#
+# NOT PRESENT (by design):
+#   - api_key        : schema-optional field. Absent here because first-run
+#                      setup (Story 2.2) writes the user's real api_key into
+#                      their %LOCALAPPDATA%/nova/settings.yaml. Shipping a
+#                      placeholder would either prevent offline-tier
+#                      detection or risk committing a fake secret.
+#   - telemetry_opt_in : no telemetry infrastructure exists in T1. The
+#                      project-context rule is "no telemetry without
+#                      explicit opt-in" and adding the field invites silent
+#                      opt-in bugs later. See docs/config-schemas.md.
+#
+# Schema reference: docs/config-schemas.md#settings-schema
+# Runtime location: %LOCALAPPDATA%/nova/settings.yaml
+
+# Personality
+bluntness: direct                 # T1 enum: {calm, direct}. Default: direct
+                                  # per ux-design-specification.md line 1041.
+                                  # `ruthless` is T2-deferred — DO NOT add it
+                                  # here. Invalid values fall back to `direct`
+                                  # with a logged warning.
+
+# Session behavior
+skip_briefing_if_recent: true     # Skip briefing if last session ended within
+                                  # `briefing_recency_threshold_minutes`.
+briefing_recency_threshold_minutes: 60

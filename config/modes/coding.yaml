@@ -1,0 +1,36 @@
+# Workspace-mode template: "coding"
+#
+# This is a WORKSPACE-MODE template — not a project starter template.
+# Defines which apps/folders/urls define the "coding" work context.
+#
+# File name (coding.yaml) = mode identifier ("coding"). The `name` field below
+# is the human-facing display name; the config loader (Story 1.6) normalizes
+# it to a file-safe slug for storage.
+#
+# Schema reference: docs/config-schemas.md#mode-schema
+# Runtime location: %LOCALAPPDATA%/nova/modes/coding.yaml (copied from here
+# on first run; never overwritten once the user has a copy).
+
+name: coding                      # Required. Display name. May contain spaces.
+
+apps:                             # Required. At least one entry.
+  - name: VS Code                 # Display-only (briefings, status, audit).
+    executable: code              # Canonical identifier for launch + window matching.
+    args: []                      # Optional. Default: [].
+  - name: Chrome
+    executable: chrome
+    args: ["--new-window"]
+  - name: Windows Terminal
+    executable: wt
+    args: []
+
+folders: []                       # Optional. Absolute paths. Not auto-opened in T1;
+                                  # used by Eyes for context awareness only.
+
+urls: []                          # Optional. Opened in default browser on mode restore.
+
+is_default: false                 # Optional. Default: false.
+                                  # Runtime semantic: `true` => suggested in startup
+                                  # briefing when no pattern-based suggestion applies,
+                                  # and used as the cold-start restore target when no
+                                  # prior session exists.
