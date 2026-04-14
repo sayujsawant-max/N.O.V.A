@@ -44,7 +44,7 @@ story_location: "{project-root}/_bmad-output/implementation-artifacts"
 development_status:
   # Epic 1: Project Foundation & Core Infrastructure
   epic-1: in-progress
-  1-0-define-yaml-config-schemas-spike: review
+  1-0-define-yaml-config-schemas-spike: done
   1-1-project-scaffolding-and-package-setup: backlog
   1-2-domain-exceptions-and-shared-types: backlog
   1-3-event-bus-and-typed-event-definitions: backlog

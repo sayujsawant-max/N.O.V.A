@@ -1,6 +1,6 @@
 # Story 1.0: Define YAML Config Schemas (Spike)
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -112,6 +112,53 @@ No automated tests in this spike (no Python project exists yet). Manual verifica
 - [Source: _bmad-output/planning-artifacts/epics.md#Story 1.6: Config Loader & Immutable NovaConfig] — downstream consumer; schemas here must match the `NovaConfig`/`ModeConfig`/`ExclusionConfig`/`UserSettings` shape expected there.
 - [Source: _bmad-output/planning-artifacts/architecture.md#Shipped defaults vs. runtime user data] — line 280, `config/` (in repo) vs. `%LOCALAPPDATA%/nova/` (runtime).
 
+## Review Findings
+
+Produced by the bmad-code-review workflow on 2026-04-14. Three parallel adversarial review layers (Blind Hunter, Edge Case Hunter, Acceptance Auditor) ran against the four Story 1.0 deliverables. Acceptance Auditor: **Approve** — all 9 ACs satisfied. Adversarial layers surfaced edge cases in the schema contract that this spike should pin (rather than letting Story 1.6 silently invent answers).
+
+**Caveat:** review ran in the same Claude session that implemented the story. Single-LLM bias is a real limitation — consider a fresh-session review before promoting Story 1.0 to `done` on anything marked `[Review][Decision]` below if this feedback feels too aligned.
+
+### Decision-Needed Findings (9)
+
+- [x] [Review][Decision] **Mode identity rule is ambiguous** — docs/config-schemas.md says mode identifier is "file name" (line 42) but also "slugified `name` or file stem" (Loader contract line 229). Pick one canonical rule. Recommendation: **file stem is the identifier**; `name:` is display-only; loader does NOT slugify `name` for storage.
+- [x] [Review][Decision] **Zero modes with `is_default: true` — cold-start target undefined** — docs/config-schemas.md §`is_default` runtime semantic covers "true" and tie-breaking but not the all-false case, which is the shipped default (coding.yaml has `is_default: false`). Recommendation: **fall back to first-alphabetical mode with a WARNING log**: "no default mode configured".
+- [x] [Review][Decision] **`apps[].executable` normalization rules unspecified** — case sensitivity, `.exe` suffix, path separators all unaddressed. Story 3.6 (launcher) and 4.1 (window match) will diverge. Recommendation: **case-insensitive compare; `.exe` suffix optional and stripped for comparison; bare name resolves via PATH, absolute path used verbatim**.
+- [x] [Review][Decision] **`urls[]` scheme allowlist missing — injection vector** — `file:///` and `javascript:` URLs are handed to the OS unchecked by Story 3.6. Recommendation: **allowlist `http://` / `https://` only; warn-and-drop everything else**.
+- [x] [Review][Decision] **`briefing_recency_threshold_minutes: 0` behavior undefined** — schema allows `0` (non-negative int) but doesn't pin whether 0 means "never skip" or "always skip". Recommendation: **`0` = never skip the briefing** (conservative — always brief).
+- [x] [Review][Decision] **Mode file with one broken entry: skip entry or skip file?** — docs/config-schemas.md Mode validation rules say "apps: missing or empty → mode file skipped" but exclusions schema says "entry skipped with warning; other entries still load". Inconsistent. Recommendation: **entry-skip at the `apps[]` level** (matches exclusions), file only skipped if `name` or the whole `apps` list is invalid.
+- [x] [Review][Decision] **Missing `exclusions.yaml` silently disables all exclusion protection** — loader defaults both lists to empty if file absent; no warning mandated. Privacy-sensitive silent behavior. Recommendation: **WARNING log at startup** ("no exclusions file — zero protection"); do not halt.
+- [x] [Review][Decision] **UTF-8 BOM behavior unspecified** — Windows Notepad saves with BOM by default; PyYAML may trip. Recommendation: **strip BOM on read; do not treat as malformed YAML**. Requiring users to re-save is user-hostile.
+- [x] [Review][Decision] **Critical warning visibility: log file only, or surface in briefing?** — mode-skip, missing-exclusions, invalid-enum fallbacks all go to `WARNING` log; on a background-service startup, users never see console logs. **Resolved:** ongoing config warnings route to both the log file and a **post-briefing tier-style notice** rendered by Skin, on the same rail as tier transitions and operational status. Bypasses Voice (operational output, not personality-bearing prose).
+
+### Patch Findings (11)
+
+- [x] [Review][Patch] **Add `folders[]` absolute-path validation rule** [docs/config-schemas.md: Mode validation rules]
+- [x] [Review][Patch] **Require non-empty strings in `excluded_apps[].match` and `excluded_title_patterns[]`** [docs/config-schemas.md: Exclusions validation]
+- [x] [Review][Patch] **`api_key` contradiction: "non-empty when present" vs "empty treated as absent"** — pick canonical (empty = absent) [docs/config-schemas.md: Settings table + validation]
+- [x] [Review][Patch] **Mode-file YAML parse error — file-skip, not hard startup error** (resolves mode rule vs cross-cutting rule conflict for singletons vs per-mode) [docs/config-schemas.md: Cross-cutting rules]
+- [x] [Review][Patch] **Clarify: YAML quoting in title patterns is cosmetic; match is always literal substring** [docs/config-schemas.md: Exclusions schema]
+- [x] [Review][Patch] **Top-level `null` YAML — treat as empty (apply defaults + WARNING)** [docs/config-schemas.md: Cross-cutting rules]
+- [x] [Review][Patch] **Top-level shape mismatch (list instead of mapping) — hard malformed-YAML error** [docs/config-schemas.md: Cross-cutting rules]
+- [x] [Review][Patch] **"Unknown keys ignored" rule applies at every depth (root, `apps[]`, `excluded_apps[]`)** [docs/config-schemas.md: Cross-cutting rules]
+- [x] [Review][Patch] **Case-sensitive `.yaml` match; `.yml` / `.YAML` / `.yaml.bak` ignored** [docs/config-schemas.md: Mode loader behavior]
+- [x] [Review][Patch] **First-run copy: `settings.defaults.yaml` renamed to `settings.yaml` on copy** [docs/config-schemas.md: Shipped defaults vs. runtime location]
+- [x] [Review][Patch] **`is_default` tie-break ignores skipped (validation-failed) modes** [docs/config-schemas.md: Mode validation rules]
+
+### Deferred (6)
+
+- [x] [Review][Defer] **Duplicate YAML keys at same level (PyYAML silent last-wins)** — deferred to Story 1.6 loader
+- [x] [Review][Defer] **Unicode case-fold under Turkish locale (dotted i)** — deferred to Story 1.6/4.2 (Python `.casefold()` handles English/most latin correctly)
+- [x] [Review][Defer] **Modes directory is a file (user/AV error state)** — deferred to Story 1.6 impl
+- [x] [Review][Defer] **CRLF trailing in string values** — deferred; no multiline string fields in current T1 schema
+- [x] [Review][Defer] **First-run copy file-lock/AV failures** — deferred to Story 2.1 (setup.bat)
+- [x] [Review][Defer] **Reserved Windows filenames (CON/NUL) in mode names** — deferred to Story 2.3 (mode wizard) and 1.6 (loader)
+
+### Dismissed (3)
+
+- [Review][Dismiss] "logged warning" lowercase in YAML comment vs `WARNING` in schema doc — stylistic nitpick.
+- [Review][Dismiss] Duplicate `excluded_apps[].match` entries — wasteful but not a correctness bug.
+- [Review][Dismiss] Concurrent edit while running — already pinned by architecture ("load once at startup, immutable thereafter").
+
 ## Dev Agent Record
 
 ### Agent Model Used
@@ -143,17 +190,30 @@ claude-opus-4-6 (1M context)
 - **Default bluntness stayed `direct`.** Per in-story guardrail: changing this is a correct-course against the UX spec (Epic 7.1 + Epic 2.3 scope), not a schema edit. Rationale captured in the reference doc so future readers don't re-litigate.
 - **No `.py` files were created at any point during implementation** — scope guard held.
 
+**Code review resolution (2026-04-14):**
+- Ran bmad-code-review with 3 parallel adversarial layers (Blind Hunter, Edge Case Hunter, Acceptance Auditor). Acceptance Auditor: Approve. Adversarial layers produced 29 unique findings after dedup.
+- Resolved 9 decision-needed findings (see Review Findings above). D9 ("warning visibility") amended by user: notices route to a post-briefing tier-style notice, not the Briefing Card.
+- Applied 11 patches directly to `docs/config-schemas.md`, pinning: `folders[]` absolute-path enforcement; non-empty validation for `excluded_apps[].match` and `excluded_title_patterns[]`; `api_key` canonical "empty = absent" (single error path, not two); mode-file YAML parse error = file-skip (not hard startup error, which applies only to singletons); YAML quoting in title patterns is cosmetic; top-level `null` = empty document with warning; top-level shape mismatch = malformed for singletons / file-skip for modes; unknown-keys rule applies at every depth; case-sensitive `.yaml` glob only (no `.yml`/`.YAML`/`.yaml.bak`); first-run copy renames `settings.defaults.yaml` → `settings.yaml`; `is_default` tie-break ignores validation-failed modes.
+- Updated inline YAML comments in `config/modes/coding.yaml`, `config/exclusions.yaml`, `config/settings.defaults.yaml` to reflect new rules (file-stem-is-identity, executable normalization, URL allowlist, threshold-zero semantic, non-empty match rule, missing-exclusions warning).
+- Re-verified all three YAMLs parse with PyYAML and contract spot-checks still pass.
+- 6 findings deferred to downstream stories (logged in `_bmad-output/implementation-artifacts/deferred-work.md`): duplicate YAML keys (Story 1.6), Turkish-locale case-fold (1.6/4.2), modes dir is a file (1.6), CRLF in string values (future schema changes), first-run copy file-lock (Story 2.1), reserved Windows filenames (Story 2.3/1.6).
+- 3 findings dismissed as noise or already-architecturally-addressed.
+- **Review caveat:** same-session adversarial review — single-LLM bias. Acceptance Auditor's Approve verdict is the clearest signal; the adversarial findings were useful regardless of bias (the edge cases exist even if a fresh LLM might have ranked them differently).
+
 ### File List
 
 - `config/modes/coding.yaml` (new) — shipped-default workspace-mode template for the "coding" mode.
 - `config/exclusions.yaml` (new) — shipped-default exclusion list (password managers in `excluded_apps`, sensitive title patterns in `excluded_title_patterns`).
 - `config/settings.defaults.yaml` (new) — shipped-default user settings baseline (no `api_key`, no `telemetry_opt_in`).
 - `docs/config-schemas.md` (new) — authoritative schema reference for modes, exclusions, and settings YAML in T1.
-- `_bmad-output/implementation-artifacts/sprint-status.yaml` (modified) — `epic-1` moved `backlog` → `in-progress`; `1-0-define-yaml-config-schemas-spike` moved `backlog` → `ready-for-dev` → `in-progress` → `review`.
-- `_bmad-output/implementation-artifacts/1-0-define-yaml-config-schemas-spike.md` (modified) — story file; task checkboxes, Dev Agent Record, File List, Change Log, Status (permitted sections only).
+- `_bmad-output/implementation-artifacts/sprint-status.yaml` (modified) — `epic-1` moved `backlog` → `in-progress`; `1-0-define-yaml-config-schemas-spike` moved `backlog` → `ready-for-dev` → `in-progress` → `review` → `done`.
+- `_bmad-output/implementation-artifacts/1-0-define-yaml-config-schemas-spike.md` (modified) — story file; task checkboxes, Dev Agent Record, File List, Change Log, Status, Review Findings (permitted sections only).
+- `_bmad-output/implementation-artifacts/deferred-work.md` (new) — log of 6 edge-case findings deferred to Story 1.6 / 2.1 / 2.3.
+- `.gitignore` (new) — ignores tooling (.claude/, .agents/, _bmad/), Python/SQLite clutter, secrets.
 
 ### Change Log
 
 | Date | Change |
 |------|--------|
 | 2026-04-14 | Story 1.0 implemented as a spike. Authored `docs/config-schemas.md` reference doc and shipped three YAML defaults in `config/`. Pinned mode, exclusions, and settings schemas for T1. Resolved three divergences from `architecture.md` (`telemetry_opt_in` excluded, `ruthless` T2-deferred, `Banking` moved to title patterns). Status → review. |
+| 2026-04-14 | Addressed code review findings — 20 items resolved (9 decisions + 11 patches). Pinned file-stem-as-mode-identity; `apps[].executable` normalization (case-insensitive, `.exe` optional, PATH for bare names); `urls[]` http/https-only allowlist (security); `briefing_recency_threshold_minutes: 0` = never skip; mode-file YAML parse error = file-skip; missing `exclusions.yaml` → warning + tier notice; UTF-8 BOM tolerated; config warnings route to post-briefing tier-style notice. 6 items deferred to 1.6/2.1/2.3, 3 dismissed. Status → done. |

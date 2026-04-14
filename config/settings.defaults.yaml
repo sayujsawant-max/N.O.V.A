@@ -29,4 +29,5 @@ bluntness: direct                 # T1 enum: {calm, direct}. Default: direct
 # Session behavior
 skip_briefing_if_recent: true     # Skip briefing if last session ended within
                                   # `briefing_recency_threshold_minutes`.
-briefing_recency_threshold_minutes: 60
+briefing_recency_threshold_minutes: 60   # Minutes. `0` means NEVER skip (always brief).
+                                         # Negative or non-int falls back to 60 with warning.

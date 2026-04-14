@@ -2,25 +2,38 @@
 #
 # Two lists, two matching semantics:
 #   - excluded_apps:         match[i] is tested against the window's process /
-#                            executable name (case-insensitive substring).
+#                            executable name (case-insensitive substring;
+#                            `.exe` suffix stripped for comparison — same
+#                            normalization as apps[].executable in mode files).
 #                            Use this for apps with STABLE process-name
 #                            signatures (password managers, specific vaults).
+#                            Empty strings in `match` are REJECTED (an empty
+#                            substring matches every window — silent blackout).
 #   - excluded_title_patterns: each string is tested against the window title
 #                            text (case-insensitive substring). Use this for
 #                            title/content concepts that don't have a stable
 #                            process name (banking, credit cards, etc.).
+#                            Empty-string entries are REJECTED, same reason.
+#
+# Quoting (`"banking"` vs `banking`) is cosmetic; matching is ALWAYS literal
+# substring, never regex or glob.
 #
 # When either list matches a captured window, Eyes emits an OPAQUE event:
 #   "A protected app was active"
 # No app name, no window title, no content enters storage, cloud prompts,
 # audit trail, or transparency display.
 #
+# MISSING-FILE BEHAVIOR: if this file is absent at runtime, both lists default
+# to empty AND the loader emits a WARNING plus a post-briefing tier-style
+# notice ("exclusions.yaml not found — zero exclusion protection"). Do NOT
+# delete this file to "disable exclusions" — edit the lists instead.
+#
 # Schema reference: docs/config-schemas.md#exclusions-schema
 # Runtime location: %LOCALAPPDATA%/nova/exclusions.yaml
 
 excluded_apps:
   - name: 1Password               # Display only (for settings-UI listing).
-    match: 1password              # Case-insensitive substring on process name.
+    match: 1password              # Case-insensitive substring; non-empty required.
   - name: KeePassXC
     match: keepassxc
   - name: Bitwarden

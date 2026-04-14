@@ -3,19 +3,23 @@
 # This is a WORKSPACE-MODE template — not a project starter template.
 # Defines which apps/folders/urls define the "coding" work context.
 #
-# File name (coding.yaml) = mode identifier ("coding"). The `name` field below
-# is the human-facing display name; the config loader (Story 1.6) normalizes
-# it to a file-safe slug for storage.
+# THE FILE STEM IS THE MODE IDENTIFIER.
+# `coding.yaml` → mode `coding` (the value the user types: `nova mode coding`).
+# The `name:` field below is DISPLAY-ONLY (briefings, status, audit) and is
+# NOT slugified, NOT used as an identifier, and NOT used for matching
+# anywhere in the loader. To rename a mode, rename the file.
 #
 # Schema reference: docs/config-schemas.md#mode-schema
 # Runtime location: %LOCALAPPDATA%/nova/modes/coding.yaml (copied from here
 # on first run; never overwritten once the user has a copy).
 
-name: coding                      # Required. Display name. May contain spaces.
+name: coding                      # Required. Display name. May contain spaces. Display-only.
 
 apps:                             # Required. At least one entry.
   - name: VS Code                 # Display-only (briefings, status, audit).
-    executable: code              # Canonical identifier for launch + window matching.
+    executable: code              # Canonical identifier. Case-insensitive; `.exe` suffix
+                                  # optional (stripped for comparison). Bare name -> PATH
+                                  # lookup; absolute path used verbatim.
     args: []                      # Optional. Default: [].
   - name: Chrome
     executable: chrome
@@ -24,13 +28,21 @@ apps:                             # Required. At least one entry.
     executable: wt
     args: []
 
-folders: []                       # Optional. Absolute paths. Not auto-opened in T1;
-                                  # used by Eyes for context awareness only.
+folders: []                       # Optional. Absolute path strings only. Relative paths,
+                                  # nulls, and non-strings are dropped with warning.
+                                  # Not auto-opened in T1; used by Eyes for context
+                                  # awareness only.
 
 urls: []                          # Optional. Opened in default browser on mode restore.
+                                  # Scheme allowlist: http:// and https:// ONLY.
+                                  # Anything else (file:, javascript:, data:, bare paths)
+                                  # is dropped with warning — this is a security boundary.
 
 is_default: false                 # Optional. Default: false.
                                   # Runtime semantic: `true` => suggested in startup
                                   # briefing when no pattern-based suggestion applies,
                                   # and used as the cold-start restore target when no
-                                  # prior session exists.
+                                  # prior session exists. Zero-case (no mode sets true):
+                                  # briefing omits the suggestion line; cold-start restore
+                                  # falls back to the first alphabetically-sorted file
+                                  # stem with a WARNING log.
