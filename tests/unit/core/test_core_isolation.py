@@ -29,6 +29,7 @@ from types import ModuleType
 
 import pytest
 
+import nova.core.config as config_module
 import nova.core.events as events_module
 import nova.core.exceptions as exceptions_module
 import nova.core.storage.engine as storage_engine_module
@@ -124,6 +125,29 @@ MIGRATION_RUNNER_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
         "re",
         "shutil",
         "typing",
+    }
+)
+
+# `core/config.py` (Story 1.6) is the sole core module that may import
+# `yaml` — it IS the YAML boundary. Every other adapter/forbidden module
+# remains blocked. Allowlist below covers stdlib + the single first-party
+# `nova` segment for `nova.core.exceptions` / `nova.core.types` imports.
+# Deliberately excluded: `os` (pathlib handles all path operations),
+# `datetime` (no timestamp fields in T1 schema), `collections` (dict/tuple
+# are builtins), `sys`.
+CONFIG_FORBIDDEN_TOPLEVEL_MODULES: frozenset[str] = FORBIDDEN_TOPLEVEL_MODULES - {"yaml"}
+
+CONFIG_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "logging",
+        "nova",
+        "pathlib",
+        "re",
+        "typing",
+        "yaml",
     }
 )
 
@@ -227,6 +251,7 @@ def _dynamic_import_targets(tree: ast.AST) -> list[str]:
         events_module,
         storage_engine_module,
         migration_runner_module,
+        config_module,
     ],
 )
 def test_no_relative_imports(module: ModuleType) -> None:
@@ -280,6 +305,7 @@ def test_enum_imports_use_public_symbols_only(module: ModuleType) -> None:
         events_module,
         storage_engine_module,
         migration_runner_module,
+        config_module,
     ],
 )
 def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
@@ -290,15 +316,18 @@ def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
     ``test_storage_engine_forbidden_imports_minus_sqlite3`` guards the
     narrower dynamic-import-minus-sqlite3 check. The migration runner
     (Story 1.5) does NOT get the sqlite3 carve-out — it must use the
-    storage engine, never `sqlite3` directly.
+    storage engine, never `sqlite3` directly. ``core/config.py`` (Story 1.6)
+    has its own carve-out for ``yaml`` via
+    ``CONFIG_FORBIDDEN_TOPLEVEL_MODULES``.
     """
     tree = ast.parse(_read_module_source(module))
     targets = _dynamic_import_targets(tree)
-    forbidden = (
-        STORAGE_ENGINE_FORBIDDEN_TOPLEVEL_MODULES
-        if module is storage_engine_module
-        else FORBIDDEN_TOPLEVEL_MODULES
-    )
+    if module is storage_engine_module:
+        forbidden = STORAGE_ENGINE_FORBIDDEN_TOPLEVEL_MODULES
+    elif module is config_module:
+        forbidden = CONFIG_FORBIDDEN_TOPLEVEL_MODULES
+    else:
+        forbidden = FORBIDDEN_TOPLEVEL_MODULES
     leaked = set(targets) & forbidden
     assert not leaked, f"Dynamic adapter imports detected in {module.__name__}: {sorted(leaked)}."
 
@@ -513,6 +542,69 @@ def test_migration_runner_does_not_dynamically_import_nova_adapters_or_systems(
     module: ModuleType,
 ) -> None:
     """`importlib.import_module("nova.adapters.*")` must also be blocked from the runner."""
+    tree = ast.parse(_read_module_source(module))
+    leaked = [
+        t
+        for t in _dynamic_import_full_targets(tree)
+        if _has_forbidden_prefix(t, FORBIDDEN_NOVA_PREFIXES)
+    ]
+    assert not leaked, (
+        f"Dynamic nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+# --- Config loader (Story 1.6) isolation guards ------------------------------
+
+
+@pytest.mark.parametrize("module", [config_module])
+def test_config_forbidden_imports(module: ModuleType) -> None:
+    """`core/config.py` may import `yaml` — every other adapter remains forbidden."""
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree)}
+    leaked = used & CONFIG_FORBIDDEN_TOPLEVEL_MODULES
+    assert not leaked, f"Forbidden adapter imports leaked into {module.__name__}: {sorted(leaked)}."
+
+
+@pytest.mark.parametrize("module", [config_module])
+def test_config_imports_within_allowlist(module: ModuleType) -> None:
+    """`core/config.py` has its own stdlib allowlist (includes `yaml`)."""
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree) if m != RELATIVE_IMPORT_MARKER}
+    out_of_allowlist = used - CONFIG_ALLOWED_TOPLEVEL_MODULES
+    assert not out_of_allowlist, (
+        f"Imports outside the config allowlist: {sorted(out_of_allowlist)}. "
+        f"Allowlist is {sorted(CONFIG_ALLOWED_TOPLEVEL_MODULES)}."
+    )
+
+
+@pytest.mark.parametrize("module", [config_module])
+def test_config_does_not_import_nova_adapters_or_systems(module: ModuleType) -> None:
+    """Config module must not reach into `nova.adapters.*` / `nova.systems.*` / `nova.ports.*`."""
+    tree = ast.parse(_read_module_source(module))
+    leaked: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            if _has_forbidden_prefix(node.module, FORBIDDEN_NOVA_PREFIXES):
+                leaked.append(node.module)
+                continue
+            for alias in node.names:
+                composed = f"{node.module}.{alias.name}"
+                if _has_forbidden_prefix(composed, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(composed)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _has_forbidden_prefix(alias.name, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(alias.name)
+    assert not leaked, (
+        f"Forbidden nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+@pytest.mark.parametrize("module", [config_module])
+def test_config_does_not_dynamically_import_nova_adapters_or_systems(
+    module: ModuleType,
+) -> None:
+    """`importlib.import_module("nova.adapters.*")` must also be blocked from the config loader."""
     tree = ast.parse(_read_module_source(module))
     leaked = [
         t

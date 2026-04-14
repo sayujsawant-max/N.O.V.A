@@ -1,5 +1,14 @@
 """Shared infrastructure - events, config, tiers, audit, storage."""
 
+from nova.core.config import (
+    AppConfig,
+    ExcludedAppConfig,
+    ExclusionConfig,
+    ModeConfig,
+    NovaConfig,
+    UserSettings,
+    load_config,
+)
 from nova.core.events import (
     AppLaunched,
     ContextChanged,
@@ -34,6 +43,7 @@ __all__: list[str] = [
     "ActionType",
     "AdapterError",
     "ApiUnavailableError",
+    "AppConfig",
     "AppLaunched",
     "BluntnessLevel",
     "BriefingState",
@@ -42,10 +52,14 @@ __all__: list[str] = [
     "ContextChanged",
     "Event",
     "EventBus",
+    "ExcludedAppConfig",
+    "ExclusionConfig",
     "MemoryCategory",
     "MemoryForgotten",
+    "ModeConfig",
     "ModeNotFoundError",
     "ModeRestored",
+    "NovaConfig",
     "NovaError",
     "SeedSaved",
     "SessionEnded",
@@ -54,4 +68,6 @@ __all__: list[str] = [
     "SqliteStorageEngine",
     "StorageError",
     "TierChanged",
+    "UserSettings",
+    "load_config",
 ]
