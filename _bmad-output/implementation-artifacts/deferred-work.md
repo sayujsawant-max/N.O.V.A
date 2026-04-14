@@ -22,3 +22,10 @@ Items flagged during reviews that are real but not actionable in the story where
 - **`.gitignore` missing `coverage.xml`, `junit.xml`, `.uv_cache/`, `.hatch/`.** Belt-and-suspenders for CI report artifacts that don't exist today. **Target: Story 1.11 (CI).** Add when CI actually generates these files.
 - **Hatchling default sdist includes `_bmad-output/`, `design-artifacts/`, and the full planning tree.** Only matters if N.O.V.A. is ever published to PyPI — project-context rules this out for T1. **Target: whichever story turns on package publishing (none currently planned).**
 - **PEP 735 `[dependency-groups]` migration.** uv and PDM are converging on `[dependency-groups]` over `[project.optional-dependencies]` for dev deps. **Target: monitor — revisit when uv's guidance stabilizes or when Story 1.11 touches dep config.**
+
+---
+
+## Deferred from: code review of story 1-2-domain-exceptions-and-shared-types (2026-04-14)
+
+- **`NovaError.cause` is not preserved across `pickle` / `copy.deepcopy` round-trips.** `BaseException.__reduce__` only serializes `self.args`; the constructor's `cause=` kwarg is dropped on round-trip. **Target: whichever story introduces multiprocessing, subprocess workers, or remote-process IPC (none in T1 — architecture is single-process).** Document the limitation in `core/exceptions.py` module docstring; revisit only if cross-process exception transport ever becomes a requirement.
+- **AST isolation test crashes on namespace / zipped / frozen module deployments.** `inspect.getsourcefile()` returns `None` (or a zip-internal path that `Path.read_text()` cannot open) under `pyinstaller --onefile`, `zipapp`, or namespace-package layouts. Today the test asserts non-None. **Target: whichever story introduces packaging beyond `uv sync` + `uv run nova` (none in T1).** When a packaging story lands, switch to `importlib.resources.files(module).joinpath(...).read_text()` or guard with `pytest.skip` when source is unavailable.
