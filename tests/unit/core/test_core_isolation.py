@@ -29,12 +29,41 @@ from types import ModuleType
 
 import pytest
 
+import nova.core.events as events_module
 import nova.core.exceptions as exceptions_module
 import nova.core.types as types_module
 
 ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset({"enum", "__future__"})
 
 ALLOWED_ENUM_SYMBOLS: frozenset[str] = frozenset({"StrEnum", "Enum", "IntEnum", "auto", "unique"})
+
+# `core/events.py` (Story 1.3) legitimately imports from the stdlib modules
+# below and from the single first-party module `nova.core.types`. The
+# FORBIDDEN_TOPLEVEL_MODULES check still blocks adapter modules; an additional
+# sub-package check (`test_events_does_not_import_nova_adapters_or_systems`)
+# closes the `nova.*` first-segment hole.
+EVENTS_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "asyncio",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "enum",
+        "logging",
+        "nova",
+        "typing",
+    }
+)
+
+# Dotted prefixes forbidden inside `core/events.py`. The `nova.*` first
+# segment is too coarse for the standard forbidden-set test (it would catch
+# `nova.core.types`), so this narrower check fires inside its own test.
+FORBIDDEN_NOVA_PREFIXES: tuple[str, ...] = (
+    "nova.adapters",
+    "nova.systems",
+    "nova.ports",
+)
 
 FORBIDDEN_TOPLEVEL_MODULES: frozenset[str] = frozenset(
     {
@@ -63,6 +92,16 @@ def _read_module_source(module: ModuleType) -> str:
     return Path(source_path_str).read_text(encoding="utf-8")
 
 
+def _has_forbidden_prefix(name: str, prefixes: tuple[str, ...]) -> bool:
+    """Exact prefix match with `.` boundary — avoids `nova.adapters_helpers` false positives.
+
+    ``name.startswith("nova.adapters")`` would match ``"nova.adapters_helpers"``
+    (no word boundary). Require either exact equality or the prefix followed
+    by a dotted sub-module segment.
+    """
+    return any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes)
+
+
 def _all_imports(tree: ast.AST) -> list[tuple[str, str | None]]:
     """Return (top_module, symbol_name) pairs for every import in the tree.
 
@@ -88,6 +127,32 @@ def _all_imports(tree: ast.AST) -> list[tuple[str, str | None]]:
     return pairs
 
 
+def _dynamic_import_full_targets(tree: ast.AST) -> list[str]:
+    """Return FULL string-literal targets of `__import__()` / `importlib.import_module()`.
+
+    Unlike `_dynamic_import_targets` (which collapses to the first dotted
+    segment), this helper preserves the entire path — necessary to catch
+    `importlib.import_module("nova.adapters.sqlite")` via the
+    `nova.adapters`-prefix check.
+    """
+    targets: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_dunder = isinstance(func, ast.Name) and func.id == "__import__"
+        is_importlib = isinstance(func, ast.Attribute) and func.attr == "import_module"
+        if not (is_dunder or is_importlib):
+            continue
+        if (
+            node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            targets.append(node.args[0].value)
+    return targets
+
+
 def _dynamic_import_targets(tree: ast.AST) -> list[str]:
     """Return string-literal targets of `__import__()` and `importlib.import_module()`."""
     targets: list[str] = []
@@ -108,7 +173,7 @@ def _dynamic_import_targets(tree: ast.AST) -> list[str]:
     return targets
 
 
-@pytest.mark.parametrize("module", [exceptions_module, types_module])
+@pytest.mark.parametrize("module", [exceptions_module, types_module, events_module])
 def test_no_relative_imports(module: ModuleType) -> None:
     """Relative imports are forbidden in core (P1)."""
     tree = ast.parse(_read_module_source(module))
@@ -118,7 +183,7 @@ def test_no_relative_imports(module: ModuleType) -> None:
     )
 
 
-@pytest.mark.parametrize("module", [exceptions_module, types_module])
+@pytest.mark.parametrize("module", [exceptions_module, types_module, events_module])
 def test_no_forbidden_imports(module: ModuleType) -> None:
     tree = ast.parse(_read_module_source(module))
     used = {m for m, _ in _all_imports(tree)}
@@ -152,10 +217,94 @@ def test_enum_imports_use_public_symbols_only(module: ModuleType) -> None:
     )
 
 
-@pytest.mark.parametrize("module", [exceptions_module, types_module])
+@pytest.mark.parametrize("module", [exceptions_module, types_module, events_module])
 def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
     """`importlib.import_module(...)` and `__import__(...)` cannot reach adapters (P2)."""
     tree = ast.parse(_read_module_source(module))
     targets = _dynamic_import_targets(tree)
     leaked = set(targets) & FORBIDDEN_TOPLEVEL_MODULES
     assert not leaked, f"Dynamic adapter imports detected in {module.__name__}: {sorted(leaked)}."
+
+
+@pytest.mark.parametrize("module", [events_module])
+def test_events_imports_within_allowlist(module: ModuleType) -> None:
+    """`core/events.py` (Story 1.3) has its own wider stdlib allowlist.
+
+    `core/exceptions.py` and `core/types.py` stay on the tighter
+    `{"enum", "__future__"}` allowlist. `events.py` needs `dataclasses`,
+    `datetime`, `logging`, `collections`, and the first-party
+    `nova.core.types` — all captured in EVENTS_ALLOWED_TOPLEVEL_MODULES.
+    """
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree) if m != RELATIVE_IMPORT_MARKER}
+    out_of_allowlist = used - EVENTS_ALLOWED_TOPLEVEL_MODULES
+    assert not out_of_allowlist, (
+        f"Imports outside the events allowlist: {sorted(out_of_allowlist)}. "
+        f"Allowlist is {sorted(EVENTS_ALLOWED_TOPLEVEL_MODULES)}."
+    )
+
+
+@pytest.mark.parametrize("module", [events_module])
+def test_events_does_not_import_nova_adapters_or_systems(module: ModuleType) -> None:
+    """`core/events.py` must not reach into `nova.adapters.*`, `nova.systems.*`, or `nova.ports.*`.
+
+    The standard forbidden-set test splits on `.` and takes the first
+    segment, so `"nova"` is a legitimate first segment and cannot express
+    "forbid `nova.adapters.*`". This narrower check walks the full
+    dotted path on every import form:
+
+    - ``import nova.adapters.sqlite`` / ``import nova.adapters.sqlite as x``
+      → caught via ``alias.name``.
+    - ``from nova.adapters.sqlite import X`` → caught via ``node.module``.
+    - ``from nova import adapters`` → caught via the ``(node.module,
+      alias.name)`` combination: when ``node.module == "nova"`` and an
+      imported symbol is a forbidden sub-package (``adapters`` /
+      ``systems`` / ``ports``), the composed ``nova.<symbol>`` matches
+      ``FORBIDDEN_NOVA_PREFIXES``.
+
+    Prefix matching uses `_has_forbidden_prefix` (exact equality or
+    prefix + ``.`` boundary), so legitimate future names like
+    ``nova.adapters_helpers`` would NOT false-positive.
+    """
+    tree = ast.parse(_read_module_source(module))
+    leaked: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            if _has_forbidden_prefix(node.module, FORBIDDEN_NOVA_PREFIXES):
+                leaked.append(node.module)
+                continue
+            # `from nova import adapters` — node.module is "nova",
+            # each alias.name is the sub-package being imported.
+            for alias in node.names:
+                composed = f"{node.module}.{alias.name}"
+                if _has_forbidden_prefix(composed, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(composed)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _has_forbidden_prefix(alias.name, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(alias.name)
+    assert not leaked, (
+        f"Forbidden nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+@pytest.mark.parametrize("module", [events_module])
+def test_events_does_not_dynamically_import_nova_adapters_or_systems(
+    module: ModuleType,
+) -> None:
+    """`importlib.import_module("nova.adapters.*")` must be blocked too.
+
+    The shared `_dynamic_import_targets` helper collapses to the first
+    dotted segment, which would surface `"nova.adapters.sqlite"` as just
+    `"nova"` (not in the forbidden set). Use `_dynamic_import_full_targets`
+    instead so the full path is available for `_has_forbidden_prefix`.
+    """
+    tree = ast.parse(_read_module_source(module))
+    leaked = [
+        t
+        for t in _dynamic_import_full_targets(tree)
+        if _has_forbidden_prefix(t, FORBIDDEN_NOVA_PREFIXES)
+    ]
+    assert not leaked, (
+        f"Dynamic nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )

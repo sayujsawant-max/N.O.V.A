@@ -29,3 +29,11 @@ Items flagged during reviews that are real but not actionable in the story where
 
 - **`NovaError.cause` is not preserved across `pickle` / `copy.deepcopy` round-trips.** `BaseException.__reduce__` only serializes `self.args`; the constructor's `cause=` kwarg is dropped on round-trip. **Target: whichever story introduces multiprocessing, subprocess workers, or remote-process IPC (none in T1 — architecture is single-process).** Document the limitation in `core/exceptions.py` module docstring; revisit only if cross-process exception transport ever becomes a requirement.
 - **AST isolation test crashes on namespace / zipped / frozen module deployments.** `inspect.getsourcefile()` returns `None` (or a zip-internal path that `Path.read_text()` cannot open) under `pyinstaller --onefile`, `zipapp`, or namespace-package layouts. Today the test asserts non-None. **Target: whichever story introduces packaging beyond `uv sync` + `uv run nova` (none in T1).** When a packaging story lands, switch to `importlib.resources.files(module).joinpath(...).read_text()` or guard with `pytest.skip` when source is unavailable.
+
+---
+
+## Deferred from: code review of story 1-3-event-bus-and-typed-event-definitions (2026-04-14)
+
+- **Frozen dataclass `__hash__` and `__eq__` contracts not locked by tests.** `@dataclass(frozen=True)` auto-generates `__hash__`; a future field of unhashable type (e.g. `dict`, `list`, a mutable dataclass) breaks `hash()` at runtime. **Target: whichever downstream story first uses events as dict keys or set members (Story 3.5 Nerve routing is the likely first consumer).** Add parametrized hash/equality tests then.
+- **Pickle / `copy.deepcopy` round-trip of events not tested.** Not used in T1 (single-process, no IPC, no durable event persistence). **Target: Story 1.8 AuditLogger if it ever serializes event references.** Architecture currently records actions, not events, so this may never become relevant.
+- **Field-schema string comparison is fragile under formatter changes.** `from __future__ import annotations` stores `f.type` as raw source text; reformatting or switching between `Optional[str]` and `str | None` breaks the test without a real type-contract change. **Target: revisit if the test starts churning during refactors.** Migration path: switch to `typing.get_type_hints(cls)` for runtime type resolution.
