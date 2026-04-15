@@ -29,6 +29,7 @@ from types import ModuleType
 
 import pytest
 
+import nova.core.audit as audit_module
 import nova.core.config as config_module
 import nova.core.events as events_module
 import nova.core.exceptions as exceptions_module
@@ -177,6 +178,31 @@ TIERS_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
     }
 )
 
+# `core/audit.py` (Story 1.8) is the single audit-write boundary. It has
+# NO carve-out from the global FORBIDDEN denylist — sqlite3 access is
+# transitive via the injected `SqliteStorageEngine`, never direct. The
+# narrow stdlib allowlist below covers the actual surface: `json` for
+# `details` serialization, `logging` for the structured log calls,
+# `collections` for `collections.abc.Mapping`, `typing` for `Literal`,
+# and the single first-party `nova` segment for events / exceptions /
+# storage.engine / types imports. Deliberately excluded: `asyncio` (no
+# Lock / sleep / create_task — the engine handles serialization),
+# `datetime` (timestamp comes from `nova.core.events._utc_now_iso`),
+# `pathlib` / `os` (no filesystem), `dataclasses` (plain class), `sqlite3`
+# (transitive only).
+AUDIT_FORBIDDEN_TOPLEVEL_MODULES: frozenset[str] = FORBIDDEN_TOPLEVEL_MODULES
+
+AUDIT_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "collections",
+        "json",
+        "logging",
+        "nova",
+        "typing",
+    }
+)
+
 # Sentinel used in `_all_imports` to flag relative imports — they have no
 # legitimate place in `core/exceptions.py` or `core/types.py`.
 RELATIVE_IMPORT_MARKER = "<relative>"
@@ -279,6 +305,7 @@ def _dynamic_import_targets(tree: ast.AST) -> list[str]:
         migration_runner_module,
         config_module,
         tiers_module,
+        audit_module,
     ],
 )
 def test_no_relative_imports(module: ModuleType) -> None:
@@ -334,6 +361,7 @@ def test_enum_imports_use_public_symbols_only(module: ModuleType) -> None:
         migration_runner_module,
         config_module,
         tiers_module,
+        audit_module,
     ],
 )
 def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
@@ -347,7 +375,8 @@ def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
     storage engine, never `sqlite3` directly. ``core/config.py`` (Story 1.6)
     has its own carve-out for ``yaml`` via
     ``CONFIG_FORBIDDEN_TOPLEVEL_MODULES``. ``core/tiers.py`` (Story 1.7)
-    has NO carve-out — the full global forbidden set applies.
+    and ``core/audit.py`` (Story 1.8) have NO carve-out — the full global
+    forbidden set applies.
     """
     tree = ast.parse(_read_module_source(module))
     targets = _dynamic_import_targets(tree)
@@ -357,6 +386,8 @@ def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
         forbidden = CONFIG_FORBIDDEN_TOPLEVEL_MODULES
     elif module is tiers_module:
         forbidden = TIERS_FORBIDDEN_TOPLEVEL_MODULES
+    elif module is audit_module:
+        forbidden = AUDIT_FORBIDDEN_TOPLEVEL_MODULES
     else:
         forbidden = FORBIDDEN_TOPLEVEL_MODULES
     leaked = set(targets) & forbidden
@@ -709,6 +740,78 @@ def test_tiers_does_not_dynamically_import_nova_adapters_or_systems(
     module: ModuleType,
 ) -> None:
     """`importlib.import_module("nova.adapters.*")` must also be blocked from tiers."""
+    tree = ast.parse(_read_module_source(module))
+    leaked = [
+        t
+        for t in _dynamic_import_full_targets(tree)
+        if _has_forbidden_prefix(t, FORBIDDEN_NOVA_PREFIXES)
+    ]
+    assert not leaked, (
+        f"Dynamic nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+# --- Audit logger (Story 1.8) isolation guards -------------------------------
+
+
+@pytest.mark.parametrize("module", [audit_module])
+def test_audit_forbidden_imports(module: ModuleType) -> None:
+    """`core/audit.py` has NO carve-out — the full FORBIDDEN_TOPLEVEL_MODULES denylist applies.
+
+    Audit module reaches sqlite3 only **transitively** through the
+    injected ``SqliteStorageEngine``; it never imports ``sqlite3``,
+    ``yaml``, ``anthropic``, ``rich``, or any Win32 binding directly.
+    """
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree)}
+    leaked = used & AUDIT_FORBIDDEN_TOPLEVEL_MODULES
+    assert not leaked, f"Forbidden adapter imports leaked into {module.__name__}: {sorted(leaked)}."
+
+
+@pytest.mark.parametrize("module", [audit_module])
+def test_audit_imports_within_allowlist(module: ModuleType) -> None:
+    """`core/audit.py` has a narrow stdlib allowlist — no carve-out needed."""
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree) if m != RELATIVE_IMPORT_MARKER}
+    out_of_allowlist = used - AUDIT_ALLOWED_TOPLEVEL_MODULES
+    assert not out_of_allowlist, (
+        f"Imports outside the audit allowlist: {sorted(out_of_allowlist)}. "
+        f"Allowlist is {sorted(AUDIT_ALLOWED_TOPLEVEL_MODULES)}."
+    )
+
+
+@pytest.mark.parametrize("module", [audit_module])
+def test_audit_does_not_import_nova_adapters_or_systems(module: ModuleType) -> None:
+    """Audit module must not reach into `nova.adapters.*` / `nova.systems.*` / `nova.ports.*`.
+
+    Audit consumes ``SqliteStorageEngine`` (a ``nova.core`` module) via
+    constructor injection — never an adapter, never a system facade.
+    """
+    tree = ast.parse(_read_module_source(module))
+    leaked: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            if _has_forbidden_prefix(node.module, FORBIDDEN_NOVA_PREFIXES):
+                leaked.append(node.module)
+                continue
+            for alias in node.names:
+                composed = f"{node.module}.{alias.name}"
+                if _has_forbidden_prefix(composed, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(composed)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _has_forbidden_prefix(alias.name, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(alias.name)
+    assert not leaked, (
+        f"Forbidden nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+@pytest.mark.parametrize("module", [audit_module])
+def test_audit_does_not_dynamically_import_nova_adapters_or_systems(
+    module: ModuleType,
+) -> None:
+    """`importlib.import_module("nova.adapters.*")` must also be blocked from audit."""
     tree = ast.parse(_read_module_source(module))
     leaked = [
         t

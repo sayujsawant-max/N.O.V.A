@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-15 (Story 1.7: done — capability tier state machine; code review applied 6 patches, 466 tests pass + 1 skip)
+# last_updated: 2026-04-15 (Story 1.8: done — audit logger; code review applied 7 patches, 514 tests pass + 1 skip)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -52,7 +52,7 @@ development_status:
   1-5-migration-runner-and-initial-schema: done
   1-6-config-loader-and-immutable-novaconfig: done
   1-7-capability-tier-state-machine: done
-  1-8-audit-logger: backlog
+  1-8-audit-logger: done
   1-9-port-interfaces-and-shield-stub: backlog
   1-10-composition-root-and-cli-entrypoint: backlog
   1-11-ci-quality-gate-automation: backlog

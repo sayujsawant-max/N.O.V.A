@@ -1,5 +1,12 @@
 """Shared infrastructure - events, config, tiers, audit, storage."""
 
+from nova.core.audit import (
+    RESULT_FAILED,
+    RESULT_SKIPPED,
+    RESULT_SUCCESS,
+    ActionResult,
+    AuditLogger,
+)
 from nova.core.config import (
     AppConfig,
     ExcludedAppConfig,
@@ -41,11 +48,13 @@ from nova.core.types import (
 )
 
 __all__: list[str] = [
+    "ActionResult",
     "ActionType",
     "AdapterError",
     "ApiUnavailableError",
     "AppConfig",
     "AppLaunched",
+    "AuditLogger",
     "BluntnessLevel",
     "BriefingState",
     "CapabilityTier",
@@ -63,6 +72,9 @@ __all__: list[str] = [
     "ModeRestored",
     "NovaConfig",
     "NovaError",
+    "RESULT_FAILED",
+    "RESULT_SKIPPED",
+    "RESULT_SUCCESS",
     "SeedSaved",
     "SessionEnded",
     "SessionStarted",
