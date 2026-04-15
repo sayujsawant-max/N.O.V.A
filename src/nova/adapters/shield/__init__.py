@@ -3,5 +3,12 @@
 The real Win32 focus-protection adapter arrives in v0.15. The no-op stub
 created in Story 1.9 remains available for tests and offline scenarios
 even after the real adapter ships (per Story 1.9 AC #18 cross-story
-notes).
+notes). Story 1.10 adds the short-path re-export so the composition root
+imports via ``from nova.adapters.shield import NoOpShieldAdapter``.
 """
+
+from nova.adapters.shield.noop import NoOpShieldAdapter
+
+__all__: list[str] = [
+    "NoOpShieldAdapter",
+]

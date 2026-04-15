@@ -1,4 +1,197 @@
-"""Composition root - wires ports to adapters, boots the monolith.
+"""Composition root — wires ports to adapters, boots the monolith.
 
-Implementation deferred to Story 1.10.
+This module is the ONE place in the codebase that instantiates concrete
+adapter classes. Every other module depends on port Protocols
+(``nova.ports.*``) or core infrastructure (``nova.core.*``); only
+``app.py`` and ``cli.py`` may import from ``nova.adapters.*``. This
+invariant is locked by ``tests/unit/test_composition_root.py``.
+
+Scope (Story 1.10)
+------------------
+T1's composition root wires only the infrastructure that already ships:
+
+    1. :class:`nova.core.SqliteStorageEngine` (Story 1.4)
+    2. Migration runner (Story 1.5) — invoked via ``engine.run_migrations``
+    3. :class:`nova.core.EventBus` (Story 1.3)
+    4. :class:`nova.core.AuditLogger` (Story 1.8) — constructed AFTER the
+       engine is started so writes never vanish silently (closes a
+       deferred-work item from Story 1.8 code review).
+    5. :class:`nova.core.TierManager` (Story 1.7) with a no-op
+       :class:`nova.core.HealthCheck` that never fails (real Claude-backed
+       probe arrives with :class:`nova.adapters.claude.*`).
+    6. :class:`nova.adapters.shield.NoOpShieldAdapter` (Story 1.9) — the
+       only port-implementing adapter that exists today.
+
+Brain / Eyes / Hands / Voice / Skin / Nerve / Ritual adapters and system
+classes are NOT wired here — those arrive with their own stories.
+Speculative stubs would violate the "adapters may translate, never
+decide" rule (project-context.md:77) and would force a rewrite when real
+adapters land.
+
+Lifecycle
+---------
+``create_app`` must be called inside an active asyncio loop;
+``nova.cli.main`` provides that via ``asyncio.run``, which gives the
+engine a single loop for the entire process lifetime. This closes the
+Story 1.4 deferred-work item about cross-loop engine drift: there is no
+second loop.
 """
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+
+from nova.adapters.shield import NoOpShieldAdapter
+from nova.core import (
+    AuditLogger,
+    CapabilityTier,
+    EventBus,
+    NovaConfig,
+    SqliteStorageEngine,
+    TierManager,
+)
+from nova.ports import ShieldPort
+
+logger = logging.getLogger("nova.app")
+
+
+class _AlwaysHealthyCheck:
+    """T1 no-op :class:`nova.core.HealthCheck`.
+
+    Satisfies the Protocol structurally: ``ping`` returns ``None`` on
+    every invocation, never raises. The real Claude-backed probe arrives
+    with :class:`nova.adapters.claude.ClaudeReasoningAdapter` — at that
+    point the composition root will swap this instance out.
+
+    Keeps :class:`TierManager` in :attr:`CapabilityTier.FULL` indefinitely
+    because the recovery loop sees no failure signal.
+    """
+
+    async def ping(self, *, timeout_seconds: float) -> None:
+        # timeout_seconds is part of the structural HealthCheck contract
+        # but irrelevant for a stub that never performs I/O.
+        del timeout_seconds
+
+
+@dataclass(frozen=True, slots=True)
+class NovaApp:
+    """Wired infrastructure graph returned by :func:`create_app`.
+
+    Downstream stories extend this dataclass by adding fields (Brain,
+    Eyes, Hands, Voice, Skin, Nerve, Ritual). They never replace it.
+
+    The ``close`` callable performs teardown — Story 1.10 closes only the
+    storage engine; future stories chain adapter-specific shutdowns in
+    reverse-of-construction order.
+    """
+
+    config: NovaConfig
+    storage: SqliteStorageEngine
+    event_bus: EventBus
+    audit: AuditLogger
+    tier_manager: TierManager
+    shield: ShieldPort
+    close: Callable[[], Awaitable[None]] = field(repr=False)
+
+
+async def create_app(
+    config: NovaConfig,
+    *,
+    shield: ShieldPort | None = None,
+) -> NovaApp:
+    """Construct the wired :class:`NovaApp` graph.
+
+    Parameters
+    ----------
+    config
+        Immutable :class:`NovaConfig` loaded by
+        :func:`nova.core.config.load_config`.
+    shield
+        Optional :class:`nova.ports.ShieldPort` implementation. Defaults
+        to :class:`NoOpShieldAdapter`. This knob exists to prove
+        structural Protocol conformance works end-to-end; it is NOT the
+        template for future adapters (brain / eyes / hands / etc. land
+        as positional dataclass fields of :class:`NovaApp`, not as
+        keyword arguments here).
+
+    Construction order matters
+    --------------------------
+    1. ``SqliteStorageEngine`` is constructed and started FIRST.
+    2. Migrations run SECOND.
+    3. ``AuditLogger`` is constructed THIRD, AFTER the engine is
+       started — otherwise every audit write would silently no-op with a
+       WARNING (closes Story 1.8 deferred-work item).
+
+    If migrations fail, the partially-started engine is closed before
+    the exception propagates so no handle leaks.
+    """
+    storage = SqliteStorageEngine(config.db_path)
+    await storage.start()
+    logger.info(
+        "storage engine started",
+        extra={"db_path": str(config.db_path)},
+    )
+
+    # Every construction step after ``engine.start`` is guarded so a failure
+    # anywhere — migrations, AuditLogger, TierManager, NoOpShieldAdapter, or
+    # the final NovaApp() constructor — still closes the engine. The inner
+    # ``storage.close()`` is itself shielded because it can raise its own
+    # StorageError; we log that secondary failure but let the original
+    # exception propagate (chained via ``from None``-style context).
+    try:
+        applied_versions = await storage.run_migrations()
+        logger.info(
+            "migrations applied",
+            extra={"applied_count": len(applied_versions), "versions": applied_versions},
+        )
+
+        event_bus = EventBus()
+        logger.info("event bus constructed")
+
+        audit = AuditLogger(storage=storage)
+        logger.info("audit logger wired")
+
+        tier_manager = TierManager(
+            health_check=_AlwaysHealthyCheck(),
+            event_bus=event_bus,
+            initial_tier=CapabilityTier.FULL,
+        )
+        logger.info("tier manager constructed", extra={"initial_tier": str(tier_manager.tier)})
+
+        shield_adapter: ShieldPort = shield if shield is not None else NoOpShieldAdapter()
+        logger.info(
+            "shield adapter wired",
+            extra={"adapter": type(shield_adapter).__name__},
+        )
+
+        async def _close() -> None:
+            await storage.close()
+            logger.info("storage engine closed")
+
+        return NovaApp(
+            config=config,
+            storage=storage,
+            event_bus=event_bus,
+            audit=audit,
+            tier_manager=tier_manager,
+            shield=shield_adapter,
+            close=_close,
+        )
+    except BaseException:
+        # Close the engine best-effort so the file handle does not leak.
+        # Secondary failure during close is logged but never replaces the
+        # in-flight exception — operators need the original cause, not the
+        # teardown artifact.
+        try:
+            await storage.close()
+        except Exception:
+            logger.exception("secondary error closing engine during partial-init teardown")
+        raise
+
+
+__all__: list[str] = [
+    "NovaApp",
+    "create_app",
+]

@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-15 (Story 1.9: done — code review applied 11 patches, 624 passed, 1 skip)
+# last_updated: 2026-04-15 (Story 1.10: done — second-pass review applied 2 more patches, 740 passed / 1 skip)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -54,7 +54,7 @@ development_status:
   1-7-capability-tier-state-machine: done
   1-8-audit-logger: done
   1-9-port-interfaces-and-shield-stub: done
-  1-10-composition-root-and-cli-entrypoint: backlog
+  1-10-composition-root-and-cli-entrypoint: done
   1-11-ci-quality-gate-automation: backlog
   epic-1-retrospective: optional
 
