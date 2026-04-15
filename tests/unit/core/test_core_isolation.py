@@ -34,6 +34,7 @@ import nova.core.events as events_module
 import nova.core.exceptions as exceptions_module
 import nova.core.storage.engine as storage_engine_module
 import nova.core.storage.migrations.runner as migration_runner_module
+import nova.core.tiers as tiers_module
 import nova.core.types as types_module
 
 ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset({"enum", "__future__"})
@@ -151,6 +152,31 @@ CONFIG_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
     }
 )
 
+# `core/tiers.py` (Story 1.7) is the capability tier state machine.
+# It has NO carve-out — tiers.py imports nothing from the FORBIDDEN set
+# (no sqlite3, no yaml, no anthropic, no rich, no Win32 surface). Every
+# entry in the global forbidden denylist is forbidden here. Allowlist
+# below covers the narrow stdlib surface it actually uses + the single
+# first-party `nova` segment for events / exceptions / types imports.
+# Deliberately excluded: `datetime` (timestamp generation lives in
+# `core/events.py`, not here), `os` (no filesystem), `pathlib` (no path
+# ops), `enum` (CapabilityTier is imported from nova.core.types, not
+# redeclared), `contextlib`/`dataclasses` (not used — state is plain
+# instance attrs; suppression is plain `try/except`).
+TIERS_FORBIDDEN_TOPLEVEL_MODULES: frozenset[str] = FORBIDDEN_TOPLEVEL_MODULES
+
+TIERS_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "asyncio",
+        "collections",
+        "logging",
+        "nova",
+        "time",
+        "typing",
+    }
+)
+
 # Sentinel used in `_all_imports` to flag relative imports — they have no
 # legitimate place in `core/exceptions.py` or `core/types.py`.
 RELATIVE_IMPORT_MARKER = "<relative>"
@@ -252,6 +278,7 @@ def _dynamic_import_targets(tree: ast.AST) -> list[str]:
         storage_engine_module,
         migration_runner_module,
         config_module,
+        tiers_module,
     ],
 )
 def test_no_relative_imports(module: ModuleType) -> None:
@@ -306,6 +333,7 @@ def test_enum_imports_use_public_symbols_only(module: ModuleType) -> None:
         storage_engine_module,
         migration_runner_module,
         config_module,
+        tiers_module,
     ],
 )
 def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
@@ -318,7 +346,8 @@ def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
     (Story 1.5) does NOT get the sqlite3 carve-out — it must use the
     storage engine, never `sqlite3` directly. ``core/config.py`` (Story 1.6)
     has its own carve-out for ``yaml`` via
-    ``CONFIG_FORBIDDEN_TOPLEVEL_MODULES``.
+    ``CONFIG_FORBIDDEN_TOPLEVEL_MODULES``. ``core/tiers.py`` (Story 1.7)
+    has NO carve-out — the full global forbidden set applies.
     """
     tree = ast.parse(_read_module_source(module))
     targets = _dynamic_import_targets(tree)
@@ -326,6 +355,8 @@ def test_no_dynamic_imports_of_forbidden_modules(module: ModuleType) -> None:
         forbidden = STORAGE_ENGINE_FORBIDDEN_TOPLEVEL_MODULES
     elif module is config_module:
         forbidden = CONFIG_FORBIDDEN_TOPLEVEL_MODULES
+    elif module is tiers_module:
+        forbidden = TIERS_FORBIDDEN_TOPLEVEL_MODULES
     else:
         forbidden = FORBIDDEN_TOPLEVEL_MODULES
     leaked = set(targets) & forbidden
@@ -605,6 +636,79 @@ def test_config_does_not_dynamically_import_nova_adapters_or_systems(
     module: ModuleType,
 ) -> None:
     """`importlib.import_module("nova.adapters.*")` must also be blocked from the config loader."""
+    tree = ast.parse(_read_module_source(module))
+    leaked = [
+        t
+        for t in _dynamic_import_full_targets(tree)
+        if _has_forbidden_prefix(t, FORBIDDEN_NOVA_PREFIXES)
+    ]
+    assert not leaked, (
+        f"Dynamic nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+# --- Tier state machine (Story 1.7) isolation guards -------------------------
+
+
+@pytest.mark.parametrize("module", [tiers_module])
+def test_tiers_forbidden_imports(module: ModuleType) -> None:
+    """`core/tiers.py` has NO carve-out — the full FORBIDDEN_TOPLEVEL_MODULES denylist applies.
+
+    Tiers module drives cloud-tier decisions through an injected
+    ``HealthCheck`` Protocol; the Claude adapter (future story) satisfies
+    the protocol structurally. The tier module itself never imports
+    ``anthropic``, ``sqlite3``, ``yaml``, ``rich``, or any Win32 binding.
+    """
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree)}
+    leaked = used & TIERS_FORBIDDEN_TOPLEVEL_MODULES
+    assert not leaked, f"Forbidden adapter imports leaked into {module.__name__}: {sorted(leaked)}."
+
+
+@pytest.mark.parametrize("module", [tiers_module])
+def test_tiers_imports_within_allowlist(module: ModuleType) -> None:
+    """`core/tiers.py` has a narrow stdlib allowlist — no carve-out needed."""
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree) if m != RELATIVE_IMPORT_MARKER}
+    out_of_allowlist = used - TIERS_ALLOWED_TOPLEVEL_MODULES
+    assert not out_of_allowlist, (
+        f"Imports outside the tiers allowlist: {sorted(out_of_allowlist)}. "
+        f"Allowlist is {sorted(TIERS_ALLOWED_TOPLEVEL_MODULES)}."
+    )
+
+
+@pytest.mark.parametrize("module", [tiers_module])
+def test_tiers_does_not_import_nova_adapters_or_systems(module: ModuleType) -> None:
+    """Tiers module must not reach into `nova.adapters.*` / `nova.systems.*` / `nova.ports.*`.
+
+    The Claude adapter satisfies ``HealthCheck`` structurally via PEP 544
+    — no explicit inheritance, no adapter import here.
+    """
+    tree = ast.parse(_read_module_source(module))
+    leaked: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            if _has_forbidden_prefix(node.module, FORBIDDEN_NOVA_PREFIXES):
+                leaked.append(node.module)
+                continue
+            for alias in node.names:
+                composed = f"{node.module}.{alias.name}"
+                if _has_forbidden_prefix(composed, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(composed)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _has_forbidden_prefix(alias.name, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(alias.name)
+    assert not leaked, (
+        f"Forbidden nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+@pytest.mark.parametrize("module", [tiers_module])
+def test_tiers_does_not_dynamically_import_nova_adapters_or_systems(
+    module: ModuleType,
+) -> None:
+    """`importlib.import_module("nova.adapters.*")` must also be blocked from tiers."""
     tree = ast.parse(_read_module_source(module))
     leaked = [
         t

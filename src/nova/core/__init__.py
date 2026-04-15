@@ -30,6 +30,7 @@ from nova.core.exceptions import (
     StorageError,
 )
 from nova.core.storage import SqliteStorageEngine
+from nova.core.tiers import HealthCheck, TierManager
 from nova.core.types import (
     ActionType,
     BluntnessLevel,
@@ -54,6 +55,7 @@ __all__: list[str] = [
     "EventBus",
     "ExcludedAppConfig",
     "ExclusionConfig",
+    "HealthCheck",
     "MemoryCategory",
     "MemoryForgotten",
     "ModeConfig",
@@ -68,6 +70,7 @@ __all__: list[str] = [
     "SqliteStorageEngine",
     "StorageError",
     "TierChanged",
+    "TierManager",
     "UserSettings",
     "load_config",
 ]
