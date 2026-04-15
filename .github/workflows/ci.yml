@@ -1,0 +1,60 @@
+name: CI
+
+# NOTE: The "on" key is deliberately quoted. PyYAML (used by tests/unit/test_ci_workflow.py)
+# follows YAML 1.1 rules, under which unquoted bareword "on" is a boolean literal that parses
+# to Python True. Quoting preserves it as the string key the structural test expects.
+"on":
+  push:
+    branches: ['**']
+  pull_request: {}
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # uv 0.11.6 matches the local dev-machine version and comfortably exceeds the 0.5.11
+      # minimum required to open a uv.lock with revision = 3. Bump in lockstep with the
+      # documented minimum in docs/development.md when upgrading locally.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.6"
+          enable-cache: true
+
+      # Python version sourced from .python-version (single source of truth for local+CI).
+      # Do NOT hard-code "3.12" here — hard-coding is the drift this story exists to prevent.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Lint (ruff check)
+        run: uv run ruff check src/ tests/
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check src/ tests/
+
+      # Matches project-context.md:155 canonical exactly (src/ tests/).
+      # pyproject.toml [tool.mypy] files = ["src/nova", "tests"] — mypy would check both
+      # even with no args, but explicit args lock the contract.
+      - name: Type check (mypy)
+        run: uv run mypy src/ tests/
+
+      - name: Unit tests
+        run: uv run pytest tests/unit/ --cov=nova --cov-report=term --cov-report=xml
+
+      - name: Integration tests
+        run: uv run pytest tests/integration/

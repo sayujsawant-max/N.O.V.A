@@ -56,6 +56,12 @@ _bmad/
 *.log
 logs/
 
+# --- CI artifacts (Story 1.11) -----------------------------------------------
+coverage.xml
+junit.xml
+.uv_cache/
+.hatch/
+
 # --- Secrets (belt-and-suspenders — no secrets currently exist) -------------
 .env
 .env.*

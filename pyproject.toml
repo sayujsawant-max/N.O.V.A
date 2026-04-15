@@ -59,3 +59,19 @@ markers = [
     "windows_only: tests that require Windows APIs",
     "migration: schema migration tests",
 ]
+
+[tool.coverage.run]
+source = ["src/nova"]
+branch = true
+parallel = false
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
+precision = 1
+show_missing = true
+skip_covered = false

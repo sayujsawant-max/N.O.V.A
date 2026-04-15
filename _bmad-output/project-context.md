@@ -152,8 +152,8 @@ _This file contains critical rules and patterns that AI agents must follow when 
   - Test (integration): `uv run pytest tests/integration/`
   - Lint: `uv run ruff check src/ tests/`
   - Format: `uv run ruff format src/ tests/`
-  - Type check: `uv run mypy src/`
-  - Full verify: `uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/ && uv run pytest`
+  - Type check: `uv run mypy src/ tests/`
+  - Full verify: `uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/ tests/ && uv run pytest`
 - **setup.bat is the first-run entrypoint.** Users run `setup.bat` once. Subsequent sessions: `uv run nova`. The setup script is idempotent — running twice must not corrupt state or overwrite user config.
 - **User data lives in `%LOCALAPPDATA%/nova/`.** All runtime state, user config, and accumulated memory. Never in the repo working tree. The repo holds application code and shipped defaults only.
 - **Repo tree stays clean.** Local runs, tests, logs, caches, and SQLite files must not write into the repository working directory. Branch changes must never produce user data files in the repo tree.

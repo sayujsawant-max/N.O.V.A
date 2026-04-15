@@ -17,9 +17,6 @@ Items flagged during reviews that are real but not actionable in the story where
 
 ## Deferred from: code review of story 1-1-project-scaffolding-and-package-setup (2026-04-14)
 
-- **uv.lock `revision = 3` requires recent uv on CI.** Lockfile pins a revision older uv versions will reject. **Target: Story 1.11 (CI quality-gate automation).** Document a minimum `uv` version and pin it in CI runner setup.
-- **Coverage config `[tool.coverage.*]` absent.** `pytest-cov` is installed but no thresholds or report config wired. **Target: Story 1.11 (CI quality-gate automation).** Original story design already defers this.
-- **`.gitignore` missing `coverage.xml`, `junit.xml`, `.uv_cache/`, `.hatch/`.** Belt-and-suspenders for CI report artifacts that don't exist today. **Target: Story 1.11 (CI).** Add when CI actually generates these files.
 - **Hatchling default sdist includes `_bmad-output/`, `design-artifacts/`, and the full planning tree.** Only matters if N.O.V.A. is ever published to PyPI — project-context rules this out for T1. **Target: whichever story turns on package publishing (none currently planned).**
 - **PEP 735 `[dependency-groups]` migration.** uv and PDM are converging on `[dependency-groups]` over `[project.optional-dependencies]` for dev deps. **Target: monitor — revisit when uv's guidance stabilizes or when Story 1.11 touches dep config.**
 
@@ -75,6 +72,23 @@ Items flagged during reviews that are real but not actionable in the story where
 - **Concurrency test gap: cancellation mid-`execute` while engine `_tx_lock` is held.** `test_log_action_concurrent_writes_all_land` only verifies `gather` of three writes; doesn't exercise outer-transaction-holds-lock + audit-task-cancelled-mid-acquisition. Behavior is correct today (engine releases the lock on `CancelledError`); test gap only. **Target:** next test-hygiene pass — add a regression lock for this realistic shape.
 - **"Engine not started" failure mode test is merged into the generic StorageError-swallow test.** AC #15 lists 4 distinct observational-failure tests; the implementation has 4, but bullets #1 ("engine not started") and #2 ("execute monkeypatched to raise StorageError") are merged. Semantic coverage is identical — `StorageError` swallow path is locked. **Target:** next test-hygiene pass if the duplication ever feels useful; otherwise leave as-is.
 - **Test-name drift from spec's "Locked by `<name>`" anchors.** Three tests exist under different names than the spec referenced; semantics match exactly. Affects only grep-ability of the spec's "Locked by" anchors. **Target:** test-hygiene pass — rename to match the spec strings, OR retroactively edit the spec to match the implementation names.
+
+---
+
+## Deferred from: code review of story 1-11-ci-quality-gate-automation (2026-04-15)
+
+- **Concurrency cancels mid-flight validation on `main` branch too.** Rapid merges could cancel a predecessor's validation before it completes. Spec AC #1 locked the pattern; solo-dev cadence makes the risk negligible today. **Target:** revisit if multi-dev workflow begins. Fix: `cancel-in-progress: ${{ github.event_name == 'pull_request' }}` or scope `group:` by `github.head_ref || github.run_id`.
+- **`push: branches: ['**']` + `pull_request: {}` double-fires CI on every PR commit.** 2x runner minutes per PR. Spec-locked trade-off. **Target:** restrict `push:` to `main` only if minute budget tightens.
+- **`windows-latest` silent runner-image upgrade risk.** `pwsh` default-shell semantics could drift on a `windows-2022` → `windows-2025` roll. Workflow uses no shell-specific syntax today. **Target:** pin `runs-on: windows-2022` or add `defaults: { run: { shell: bash } }` if a runner upgrade breaks a step.
+- **`--cov=nova` vs `source = ["src/nova"]` two-strategy coverage resolution.** Agrees today; could drift if packaging layout changes. **Target:** consolidate to `--cov=src/nova` during next touch to coverage config or pytest invocation.
+- **Coverage `parallel = false` collides with pytest-xdist if added later.** Spec-locked for T1. **Target:** whichever story introduces pytest-xdist — flip to `parallel = true` and add `coverage combine`.
+- **`exclude_lines = ["\\.\\.\\."]` unanchored regex.** Matches any triple-dot in a source line, not just bare Ellipsis bodies. Convention-matching with coverage.py docs. **Target:** tighten to `"^\\s*\\.\\.\\.\\s*$"` if over-exclusion appears in reports.
+- **`.gitignore` CRLF rule missing from `.gitattributes`.** Current test-suite behavior is CRLF-safe (verified: `Path.read_text()` universal newlines + `splitlines()`). **Target:** add `.gitignore text eol=lf` to `.gitattributes` next time it's touched.
+- **`_extract_canonical_commands` prefix-pairing could silently mis-pair if project-context.md chain reorders.** `assert not missing` catches total-count regressions but not mis-pairing. **Target:** tighten to assert exactly-one-segment-per-prefix [tests/unit/test_ci_workflow.py:99-108].
+- **`test_workflow_runs_canonical_commands_in_order` lacks distinctness assertion.** `positions == sorted(positions)` passes trivially if prefixes collide and multiple labels match the same step. Low-risk (all prefixes unique today). **Target:** add `len(set(positions)) == len(positions)` in next test-hygiene pass.
+- **Canonical-commands regex breaks if project-context.md reformats the full-verify line to a fenced code block.** **Target:** generalize parser or pin section-heading anchor when project-context.md is next restructured.
+- **`uv >= 0.5.11` minimum documented but not enforced.** Dev on older uv hits cryptic "unsupported lockfile revision" error. Spec AC #10 was docs-only. **Target:** Story 2.1 (setup.bat) — include a `uv --version` parse + minimum check during first-run setup.
+- **AC #13 extra parametrized test added beyond spec literal list.** `test_workflow_step_starts_with_canonical_command` + `test_workflow_runs_canonical_commands_in_order` (vs. spec's single test). Superset; accounts for +9 of the "+27 tests vs. AC #15's +18 prediction" delta. Noted as spec-over-delivery; no action required.
 
 ---
 
