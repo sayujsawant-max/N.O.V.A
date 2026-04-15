@@ -892,13 +892,15 @@ So that ruff, mypy, and pytest failures are caught before code merges and local/
 
 A new user clones the repo, runs setup.bat, configures their API key, creates their first workspace mode through a guided wizard with starter workspace-mode templates, and captures an initial workspace snapshot. Setup completes in under 15 minutes. Briefing Card State A renders at the very beginning (pre-setup) and auto-transitions into the wizard.
 
-### Story 2.1: Setup Script (setup.bat)
+### Story 2.1: Setup Script (setup.bat) + Shared Path Validation
 
 As a new user on Windows 11,
 I want to run a single setup script that checks prerequisites, installs dependencies, and creates my data directory,
 So that I can get N.O.V.A. running without knowing Python packaging.
 
-**Acceptance Criteria:**
+**Story-type classification:** This is a **first-through-boundary story** (per Epic 1 retrospective, 2026-04-15). Story 2.1 introduces a new shared infrastructure module (`nova.core.paths`) plus a user-facing failure surface (setup.bat). The boundary-first invariant sweep in the *Review Focus* section below is mandatory.
+
+**Acceptance Criteria — Group A: Setup script behavior (original scope)**
 
 **Given** the user has cloned the N.O.V.A. repository on a Windows 11 machine
 **When** the user runs setup.bat
@@ -911,6 +913,56 @@ So that I can get N.O.V.A. running without knowing Python packaging.
 **And** every failure produces a clear, non-technical message with specific next action (not raw stack traces)
 **And** the script works from both cmd.exe and PowerShell
 **And** on success, the script launches the first-run wizard via uv run python -m nova.setup
+
+**Acceptance Criteria — Group B: Shared path validation module (new)**
+
+**And** a new shared module `nova.core.paths` is introduced with a public function `validate_data_dir(path: Path) -> None` that raises `ConfigError` with a product-grade (non-technical) message on any violation
+**And** `validate_data_dir` rejects the following conditions after the path has been resolved via `Path.resolve(strict=False)`:
+- **Reserved Windows names at any path segment** (case-insensitive, with or without file extension): `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`
+- **Invalid characters in any segment**: `<`, `>`, `:` (except the drive-letter colon at index 1 of the first segment), `"`, `|`, `?`, `*`
+- **Trailing dots or trailing spaces** in any segment
+- **Resolved path points to a file** (not a directory) that already exists on the current host
+**And** when the resolved path exceeds the current host's supported Windows path limit (detected at runtime via a module-level helper `_get_max_path_length()` — NOT hard-coded to 260), validation raises `ConfigError` with the specific message: *"Path too long for this system. Shorten the path or enable Windows long-path support."*
+**And** `_get_max_path_length()` is called through the module attribute (e.g., `paths._get_max_path_length()`) so tests can monkeypatch it — follows the two-function clock indirection pattern (see `docs/cross-cutting-patterns.md`, Pattern #1)
+**And** `nova.core.paths` is pure (no I/O beyond `Path.resolve`), synchronous, and has no imports from `nova.adapters.*` or `nova.systems.*` — enforced by an AST guard test (follows `docs/cross-cutting-patterns.md`, Pattern #2)
+**And** all validation failure messages are opaque-friendly: they name the offending segment and the reason, but never include the full input path, no filesystem metadata, and no stack traces in the user-visible surface
+
+**Acceptance Criteria — Group C: Validation applied at both call sites (new)**
+
+**And** `nova.setup` (the first-run entrypoint launched by setup.bat via `uv run python -m nova.setup`) calls `validate_data_dir(data_dir)` on the resolved `%LOCALAPPDATA%/nova/` path **before creating any subdirectories** — validation must run before `mkdir` so a bad path never produces partial state
+**And** on validation failure in the setup flow, setup.bat exits with a clear non-technical message naming the offending segment and suggesting a remedy (e.g., *"Your user data path contains a reserved Windows name: 'CON'. Choose a different Windows user profile or contact support."*) — no Python traceback reaches the terminal
+**And** `cli.py` (from Story 1.10) calls `validate_data_dir(data_dir)` in `create_app` **before any directory creation** or engine start — this closes the deferred Windows path validation item from Story 1.10
+**And** the cli.py change is minimal: one added call plus one translated `ConfigError` → clear exit path; no refactoring of the existing Phase A / Phase B logging structure
+**And** validation behavior is identical at both call sites (same module, same rules, same error messages)
+
+**Acceptance Criteria — Group D: Testing (new)**
+
+**And** a parametrized unit test covers every reserved name (CON, PRN, AUX, NUL, COM1–9, LPT1–9 — 22 names total) with all four variants: (a) as last segment, (b) as middle segment, (c) with `.txt` extension, (d) with different casing — 22 names × 4 variants minimum
+**And** a parametrized unit test covers each invalid character (`<`, `>`, `:`, `"`, `|`, `?`, `*`) at each segment position (first, middle, last)
+**And** a parametrized unit test covers trailing-dot and trailing-space cases on each segment position
+**And** a test asserts that the drive-letter colon at index 1 of the first segment (e.g., `C:\foo`) is NOT rejected
+**And** a test monkeypatches `_get_max_path_length()` to a small value and asserts the long-path error is raised for paths exceeding it
+**And** a test asserts validation error messages contain no full input path (only the offending segment name + reason)
+**And** an integration test exercises the cli.py path: invoking `nova --data-dir <bad-path>` produces the expected non-technical exit message and no partial directory creation
+**And** an AST guard test asserts `nova.core.paths` imports nothing from `nova.adapters.*` or `nova.systems.*`
+
+**Review Focus (boundary-first invariant sweep, per Epic 1 retrospective)**
+
+| Dimension | Resolution for this story |
+|---|---|
+| **Lifecycle** | `validate_data_dir` is pure; no start/stop state to manage. Setup flow lifecycle (venv, mkdir, copy-defaults) must tear down cleanly on validation failure: no partial %LOCALAPPDATA%/nova/ directory must be created if validation fails. |
+| **Teardown under partial failure** | If `mkdir` succeeds for one subdirectory but fails for another, setup.bat must not leave the data dir in an inconsistent state. Either: (a) no subdirs created, or (b) all subdirs created. Document which. |
+| **Concurrency model** | Validation is synchronous and pure; safe from any thread. Setup flow is single-process, single-thread; no concurrency concerns. |
+| **Cancellation** | Setup flow is synchronous. User Ctrl+C during setup.bat must produce a clean exit message (no half-created venv left in an unrecoverable state — uv handles its own rollback, but setup.bat must not leave mkdir partial if interrupted between mkdir calls). |
+| **Error translation** | All validation failures raise `ConfigError` (reuse existing domain exception from `nova.core.exceptions`; no new exception type). OS errors from `Path.resolve(strict=False)` on pathological input are caught and translated to `ConfigError`. Setup.bat translates `ConfigError` to non-technical terminal output; cli.py translates `ConfigError` to exit code + stderr message. |
+| **Test determinism** | `_get_max_path_length()` is the sole source of non-determinism in the module (OS-dependent); it must be monkeypatchable via module attribute (see Pattern #1). All other validation rules are pure. |
+| **Patterns consulted** | `Error-translation-at-boundary` (Pattern #4), `Two-function clock indirection` (Pattern #1, applied to `_get_max_path_length`), `AST-based architectural guardrails` (Pattern #2), `Per-file skip-on-error vs. singleton hard-fail` (Pattern #5 — setup is a singleton flow: hard-fail on validation error, don't skip). |
+
+**Explicit non-goals (scope fence):**
+- Setup.bat does NOT accept a `--data-dir` argument in T1. The only user-controlled path surface is `cli.py --data-dir`.
+- Long-path opt-in (registry edit or manifest) is NOT handled by N.O.V.A.; we detect the current host limit and report clearly when it's exceeded.
+- No interactive "choose a different data directory" flow — setup fails with a clear message and exits.
+- UNC paths (`\\server\share\...`) are not in scope for T1 validation; they may pass or fail incidentally but are not tested. Document as a known limitation.
 
 ### Story 2.2: API Key Configuration
 

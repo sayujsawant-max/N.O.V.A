@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-15 (Story 1.11: done — code review applied 1 patch, 12 deferred, quality gate clean at 767 passed / 1 skip)
+# last_updated: 2026-04-15 (Epic 1 retrospective completed — 5 action items approved, no replan needed, Epic 2 scope remains valid)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -56,7 +56,7 @@ development_status:
   1-9-port-interfaces-and-shield-stub: done
   1-10-composition-root-and-cli-entrypoint: done
   1-11-ci-quality-gate-automation: done
-  epic-1-retrospective: optional
+  epic-1-retrospective: done
 
   # Epic 2: First-Run Setup & Onboarding
   epic-2: backlog
