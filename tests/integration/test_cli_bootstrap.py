@@ -451,3 +451,75 @@ def test_cli_log_level_invalid_exits_with_config_error(
     assert captured.out == ""
     assert "nova:" in captured.err
     assert "TRACE" in captured.err or "invalid" in captured.err.lower()
+
+
+# --- Story 2.1 AC #36 — Step 2.5 path validation integration ---------------
+
+
+def test_cli_rejects_reserved_windows_name_in_data_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC #36 — ``nova --data-dir <reserved-name>`` exits 1 via Step 2.5.
+
+    Asserts:
+    - Exit code is :data:`EXIT_CONFIG_ERROR` (1).
+    - stderr contains the non-technical reason (reserved name).
+    - The bad path is NOT created on disk (short-circuit before any
+      mkdir).
+    """
+    bad_path = tmp_path / "CON"
+    exit_code = _invoke_nova(
+        monkeypatch,
+        data_dir=None,
+        argv=["nova", "--data-dir", str(bad_path)],
+    )
+    assert exit_code == EXIT_CONFIG_ERROR
+
+    captured = capsys.readouterr()
+    # Structured log line surfaces the reason on stderr (Phase A handler
+    # is still the only handler because Step 2.5 aborts before Step 4).
+    assert "data dir validation failed" in captured.err
+    assert "reserved Windows name" in captured.err
+
+    # Short-circuit proof: the bad path was not materialized.
+    assert not bad_path.exists()
+
+
+def test_cli_rejects_invalid_character_in_data_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Invalid character in data-dir segment also triggers Step 2.5 rejection."""
+    bad_path = tmp_path / "bad<name"
+    exit_code = _invoke_nova(
+        monkeypatch,
+        data_dir=None,
+        argv=["nova", "--data-dir", str(bad_path)],
+    )
+    assert exit_code == EXIT_CONFIG_ERROR
+    captured = capsys.readouterr()
+    assert "invalid character" in captured.err
+    assert not bad_path.exists()
+
+
+def test_cli_validation_runs_before_file_logging_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad data-dir must never produce a ``logs/`` subdirectory.
+
+    Regression guard: Phase B file-logging init (Step 4) uses
+    ``mkdir(parents=False)`` on ``logs/``. If Step 2.5 did not run,
+    or ran after Step 4, a bad path could leave ``logs/`` behind.
+    """
+    bad_path = tmp_path / "PRN"
+    _invoke_nova(
+        monkeypatch,
+        data_dir=None,
+        argv=["nova", "--data-dir", str(bad_path)],
+    )
+    assert not (bad_path / "logs").exists()
+    assert not bad_path.exists()

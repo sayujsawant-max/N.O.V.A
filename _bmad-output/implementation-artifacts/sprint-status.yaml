@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-15 (Epic 1 retrospective completed — 5 action items approved, no replan needed, Epic 2 scope remains valid)
+# last_updated: 2026-04-15 (Story 2.1 done — 17 review patches applied, 10 deferred, 920 tests passing)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -59,8 +59,8 @@ development_status:
   epic-1-retrospective: done
 
   # Epic 2: First-Run Setup & Onboarding
-  epic-2: backlog
-  2-1-setup-script-setup-bat: backlog
+  epic-2: in-progress
+  2-1-setup-script-setup-bat: done
   2-2-api-key-configuration: backlog
   2-3-guided-mode-creation-wizard: backlog
   2-4-briefing-card-state-a-initial-capture-and-setup-completion: backlog

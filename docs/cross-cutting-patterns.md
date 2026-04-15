@@ -38,7 +38,9 @@ from nova.core import events
 timestamp = events._utc_now_iso()   # NOT: from nova.core.events import _utc_now_iso
 ```
 
-**Test reference:** [tests/unit/core/test_events.py:486-500](../tests/unit/core/test_events.py#L486-L500)
+**Reuse example (determinism hook beyond clocks):** [src/nova/core/paths.py](../src/nova/core/paths.py) — `_get_max_path_length()` exposes the host's Windows long-path limit through the same module-attribute indirection. `validate_data_dir` calls `paths._get_max_path_length()` (not a local binding), so tests monkeypatch via `monkeypatch.setattr(paths, "_get_max_path_length", lambda: 50)`. The pattern generalizes to any determinism-sensitive helper, not just clocks.
+
+**Test reference:** [tests/unit/core/test_events.py:486-500](../tests/unit/core/test_events.py#L486-L500), [tests/unit/core/test_paths.py::test_long_path_rejected_via_module_attribute](../tests/unit/core/test_paths.py)
 
 **Review focus:**
 - Search for `from nova.core.events import _utc_now_iso` — **that is the violation**. Always `from nova.core import events` then `events._utc_now_iso()`.

@@ -71,6 +71,7 @@ from nova import __version__
 from nova.app import create_app
 from nova.core import NovaError, load_config
 from nova.core.exceptions import ConfigError, StorageError
+from nova.core.paths import validate_data_dir
 
 logger = logging.getLogger("nova.cli")
 
@@ -323,6 +324,17 @@ async def _async_main(args: argparse.Namespace) -> int:
 
     # Step 2: resolve data dir (pure path math; no exceptions expected).
     data_dir = _resolve_data_dir(args.data_dir, os.environ)
+
+    # Step 2.5: validate data_dir. Rejects reserved Windows names,
+    # invalid characters, trailing dots/spaces, and over-long paths.
+    # Runs BEFORE any directory creation (Phase B logging at Step 4)
+    # and BEFORE engine start (``create_app`` at Step 5). Closes the
+    # Windows-path validation item deferred from Story 1.10.
+    try:
+        validate_data_dir(data_dir)
+    except ConfigError as err:
+        logger.error("data dir validation failed", extra={"reason": str(err)})
+        return EXIT_CONFIG_ERROR
 
     # Step 3: load config. Missing / malformed data dir surfaces here.
     try:

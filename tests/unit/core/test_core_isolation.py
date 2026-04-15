@@ -33,6 +33,7 @@ import nova.core.audit as audit_module
 import nova.core.config as config_module
 import nova.core.events as events_module
 import nova.core.exceptions as exceptions_module
+import nova.core.paths as paths_module
 import nova.core.storage.engine as storage_engine_module
 import nova.core.storage.migrations.runner as migration_runner_module
 import nova.core.tiers as tiers_module
@@ -812,6 +813,95 @@ def test_audit_does_not_dynamically_import_nova_adapters_or_systems(
     module: ModuleType,
 ) -> None:
     """`importlib.import_module("nova.adapters.*")` must also be blocked from audit."""
+    tree = ast.parse(_read_module_source(module))
+    leaked = [
+        t
+        for t in _dynamic_import_full_targets(tree)
+        if _has_forbidden_prefix(t, FORBIDDEN_NOVA_PREFIXES)
+    ]
+    assert not leaked, (
+        f"Dynamic nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+# --- Path validator (Story 2.1) isolation guards -----------------------------
+
+# `core/paths.py` is a pure validator. Module-level imports: ``__future__``,
+# ``sys``, ``pathlib``, and the first-party ``nova.core.exceptions``. The
+# ``winreg`` import lives inside ``_get_max_path_length`` (Windows-only) so
+# the off-platform branch stays import-free; ``ast.walk`` still picks it up,
+# which is why the allowlist includes ``winreg``.
+PATHS_ALLOWED_TOPLEVEL_MODULES: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "sys",
+        "pathlib",
+        "nova",
+        "winreg",
+    }
+)
+
+
+@pytest.mark.parametrize("module", [paths_module])
+def test_paths_forbidden_imports(module: ModuleType) -> None:
+    """`core/paths.py` may not reach into adapter territory.
+
+    The full FORBIDDEN_TOPLEVEL_MODULES denylist applies — the validator
+    is pure and synchronous; no SQLite, no YAML, no Rich, no Win32 GUI
+    bindings. The only runtime-integration module it touches is
+    ``winreg`` (stdlib), which is not in the adapter denylist.
+    """
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree)}
+    leaked = used & FORBIDDEN_TOPLEVEL_MODULES
+    assert not leaked, f"Forbidden adapter imports leaked into {module.__name__}: {sorted(leaked)}."
+
+
+@pytest.mark.parametrize("module", [paths_module])
+def test_paths_imports_within_allowlist(module: ModuleType) -> None:
+    """`core/paths.py` imports only within its narrow stdlib + nova.core allowlist."""
+    tree = ast.parse(_read_module_source(module))
+    used = {m for m, _ in _all_imports(tree) if m != RELATIVE_IMPORT_MARKER}
+    out_of_allowlist = used - PATHS_ALLOWED_TOPLEVEL_MODULES
+    assert not out_of_allowlist, (
+        f"Imports outside the paths allowlist: {sorted(out_of_allowlist)}. "
+        f"Allowlist is {sorted(PATHS_ALLOWED_TOPLEVEL_MODULES)}."
+    )
+
+
+@pytest.mark.parametrize("module", [paths_module])
+def test_paths_does_not_import_nova_adapters_or_systems(module: ModuleType) -> None:
+    """Path validator must not reach into `nova.adapters.*` / `nova.systems.*` / `nova.ports.*`.
+
+    Per Story 2.1 AC #21 — ``nova.core.paths`` is a pure core module;
+    any import of an adapter, system facade, or port interface is an
+    architectural violation.
+    """
+    tree = ast.parse(_read_module_source(module))
+    leaked: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            if _has_forbidden_prefix(node.module, FORBIDDEN_NOVA_PREFIXES):
+                leaked.append(node.module)
+                continue
+            for alias in node.names:
+                composed = f"{node.module}.{alias.name}"
+                if _has_forbidden_prefix(composed, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(composed)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _has_forbidden_prefix(alias.name, FORBIDDEN_NOVA_PREFIXES):
+                    leaked.append(alias.name)
+    assert not leaked, (
+        f"Forbidden nova sub-package imports in {module.__name__}: {sorted(set(leaked))}."
+    )
+
+
+@pytest.mark.parametrize("module", [paths_module])
+def test_paths_does_not_dynamically_import_nova_adapters_or_systems(
+    module: ModuleType,
+) -> None:
+    """`importlib.import_module("nova.adapters.*")` must also be blocked from paths."""
     tree = ast.parse(_read_module_source(module))
     leaked = [
         t

@@ -1,17 +1,24 @@
-"""Story 1.10 AC #6, #7, #9 — ``nova.cli`` helper unit tests."""
+"""Story 1.10 AC #6, #7, #9 — ``nova.cli`` helper unit tests.
+
+Story 2.1 extension: Step 2.5 validation wiring (``validate_data_dir``).
+"""
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from nova.cli import (
     _FILE_HANDLER_NAME,
     _STDERR_HANDLER_NAME,
+    EXIT_CONFIG_ERROR,
+    _async_main,
     _build_formatter,
     _configure_file_logging,
     _configure_stderr_logging,
@@ -325,3 +332,69 @@ def test_configure_file_logging_raises_if_logs_dir_is_a_file(tmp_path: Path) -> 
         _configure_file_logging(tmp_path, logging.INFO)
     # Precondition preserved: the "file logs/" is untouched.
     assert (tmp_path / "logs").read_text(encoding="utf-8") == "not a dir"
+
+
+# --- Step 2.5 validation wiring (Story 2.1) ---------------------------------
+
+
+async def test_async_main_validate_data_dir_failure_short_circuits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #38 — a ``ConfigError`` from ``validate_data_dir`` short-circuits bootstrap.
+
+    When Step 2.5 validation fails:
+    - ``_async_main`` returns :data:`EXIT_CONFIG_ERROR` (1).
+    - ``load_config`` is NOT called (Step 3 skipped).
+    - ``_configure_file_logging`` is NOT called (Step 4 skipped).
+    - ``create_app`` is NOT called (Step 5 skipped).
+
+    The Phase A stderr handler remains attached — the caller's error
+    log reaches the user even though Phase B never initialized.
+    """
+    monkeypatch.delenv("NOVA_LOG_LEVEL", raising=False)
+    args = argparse.Namespace(data_dir=tmp_path, log_level="INFO")
+
+    with (
+        patch("nova.cli.validate_data_dir", side_effect=ConfigError("bad path")) as mock_validate,
+        patch("nova.cli.load_config") as mock_load,
+        patch("nova.cli._configure_file_logging") as mock_phase_b,
+        patch("nova.cli.create_app", new_callable=AsyncMock) as mock_create_app,
+    ):
+        result = await _async_main(args)
+
+    assert result == EXIT_CONFIG_ERROR
+    mock_validate.assert_called_once_with(tmp_path.resolve())
+    mock_load.assert_not_called()
+    mock_phase_b.assert_not_called()
+    mock_create_app.assert_not_called()
+
+
+async def test_async_main_validate_data_dir_success_continues_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation success allows bootstrap to proceed to ``load_config``.
+
+    Companion to the short-circuit test: ensures Step 2.5 is not a
+    blocking wall — a valid path lets the flow continue.
+    """
+    monkeypatch.delenv("NOVA_LOG_LEVEL", raising=False)
+    args = argparse.Namespace(data_dir=tmp_path, log_level="INFO")
+
+    # Stop at Step 3 so we don't need to mock the whole app graph —
+    # asserting ``load_config`` is reached is sufficient proof that
+    # validation passed and did not short-circuit.
+    with (
+        patch("nova.cli.validate_data_dir") as mock_validate,
+        patch("nova.cli.load_config", side_effect=ConfigError("stop here")) as mock_load,
+        patch("nova.cli._configure_file_logging") as mock_phase_b,
+        patch("nova.cli.create_app", new_callable=AsyncMock) as mock_create_app,
+    ):
+        result = await _async_main(args)
+
+    assert result == EXIT_CONFIG_ERROR  # from ``load_config`` raising, not validate
+    mock_validate.assert_called_once_with(tmp_path.resolve())
+    mock_load.assert_called_once_with(tmp_path.resolve())
+    mock_phase_b.assert_not_called()
+    mock_create_app.assert_not_called()
