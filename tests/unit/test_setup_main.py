@@ -1,13 +1,13 @@
 """Unit tests for ``nova.setup.__main__`` — first-run entrypoint.
 
 Covers Story 2.1 AC #23 (validate-only branch) and #41 (State A
-rendering). The full interactive wizard is Stories 2.2–2.4; these
-tests only exercise the scaffolding landed in 2.1.
+rendering), plus Story 2.2 AC #19-22 (API key step wiring).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from rich.console import Console
@@ -70,8 +70,15 @@ def test_main_validate_only_exits_one_on_invalid(tmp_path: Path) -> None:
 # --- State A rendering (AC #41) --------------------------------------------
 
 
-def test_main_no_args_renders_state_a_and_exits(capsys: pytest.CaptureFixture[str]) -> None:
+@patch("nova.setup.__main__.run_api_key_step", return_value=False)
+def test_main_no_args_renders_state_a_and_exits(
+    _mock_api_key: MagicMock,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Running without flags renders State A and returns 0."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     result = main([])
     assert result == EXIT_OK
     out = capsys.readouterr().out
@@ -106,3 +113,68 @@ def test_state_a_output_has_no_exclamation_marks(capsys: pytest.CaptureFixture[s
     _render_state_a(console)
     out = capsys.readouterr().out
     assert "!" not in out
+
+
+# --- Story 2.2: API key step wiring (AC #19-22) -----------------------------
+
+
+@patch("nova.setup.__main__.run_api_key_step", return_value=True)
+def test_main_calls_api_key_step_after_state_a(
+    mock_api_key: MagicMock,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``main([])`` calls ``run_api_key_step`` after rendering State A."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    result = main([])
+    assert result == EXIT_OK
+    mock_api_key.assert_called_once()
+    # State A still rendered
+    out = capsys.readouterr().out
+    assert "N.O.V.A." in out
+
+
+@patch("nova.setup.__main__.run_api_key_step", return_value=True)
+def test_main_exits_zero_when_key_configured(
+    _mock: MagicMock,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exit code is 0 regardless of whether key was configured."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert main([]) == EXIT_OK
+
+
+@patch("nova.setup.__main__.run_api_key_step", return_value=False)
+def test_main_exits_zero_when_key_skipped(
+    _mock: MagicMock,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exit code is 0 when API key is skipped."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert main([]) == EXIT_OK
+
+
+def test_validate_only_branch_unchanged_after_story_22(tmp_path: Path) -> None:
+    """Story 2.2 wiring does not affect --validate-only branch (regression)."""
+    assert main(["--validate-only", str(tmp_path / "ok")]) == EXIT_OK
+    assert main(["--validate-only", str(tmp_path / "CON")]) == EXIT_CONFIG_ERROR
+
+
+@patch("nova.setup.__main__.run_api_key_step", return_value=False)
+@patch("nova.setup.__main__._resolve_data_dir", return_value=None)
+def test_main_skips_api_key_when_localappdata_missing(
+    _mock_resolve: MagicMock,
+    _mock_api_key: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When LOCALAPPDATA is not set, skip API key step gracefully."""
+    result = main([])
+    assert result == EXIT_OK
+    _mock_api_key.assert_not_called()
+    out = capsys.readouterr().out
+    assert "LOCALAPPDATA" in out

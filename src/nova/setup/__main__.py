@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from rich.text import Text
 
 from nova.core.exceptions import ConfigError
 from nova.core.paths import validate_data_dir
+from nova.setup.api_key import run_api_key_step
 
 
 def _force_utf8_stdout() -> None:
@@ -99,6 +101,19 @@ def _handle_validate_only(path_arg: str, console: Console) -> int:
     return EXIT_OK
 
 
+def _resolve_data_dir() -> Path | None:
+    """Resolve the user data directory from ``LOCALAPPDATA``.
+
+    Returns ``None`` if ``LOCALAPPDATA`` is not set — the caller must
+    handle this gracefully (skip the step, don't crash).  Matches
+    ``setup.bat``'s resolution convention.
+    """
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        return None
+    return Path(localappdata) / "nova"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m nova.setup",
@@ -128,6 +143,16 @@ def main(argv: list[str] | None = None) -> int:
         return _handle_validate_only(args.validate_only, console)
 
     _render_state_a(console)
+
+    # Story 2.2: API key configuration step
+    data_dir = _resolve_data_dir()
+    if data_dir is not None:
+        run_api_key_step(console, data_dir)
+    else:
+        console.print(
+            "[yellow]\u26a0[/yellow] LOCALAPPDATA not set. Skipping API key configuration."
+        )
+
     return EXIT_OK
 
 
