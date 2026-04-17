@@ -1,13 +1,15 @@
 """Unit tests for ``nova.setup.__main__`` — first-run entrypoint.
 
 Covers Story 2.1 AC #23 (validate-only branch) and #41 (State A
-rendering), plus Story 2.2 AC #19-22 (API key step wiring).
+rendering), Story 2.2 AC #19-22 (API key step wiring), and Story 2.4
+AC #3 / #26-#28 (already-setup fast path + capture+persist wiring).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from rich.console import Console
@@ -19,6 +21,25 @@ from nova.setup.__main__ import (
     _render_state_a,
     main,
 )
+
+
+# Story 2.4 — the new async helpers default to "not already setup" and
+# "persist succeeds" so pre-Story-2.4 tests still exercise their
+# original flows without having to think about capture/persist wiring.
+def _patch_story_24_helpers(func: Callable[..., object]) -> Callable[..., object]:
+    """Combine the two AsyncMock patches that every State-A test needs."""
+    probe_patch = patch(
+        "nova.setup.__main__._probe_setup_complete",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    persist_patch = patch(
+        "nova.setup.__main__._run_initial_capture_and_persist",
+        new_callable=AsyncMock,
+        return_value=EXIT_OK,
+    )
+    return probe_patch(persist_patch(func))
+
 
 # --- --validate-only branch (AC #23) ---------------------------------------
 
@@ -70,11 +91,14 @@ def test_main_validate_only_exits_one_on_invalid(tmp_path: Path) -> None:
 # --- State A rendering (AC #41) --------------------------------------------
 
 
+@_patch_story_24_helpers
 @patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=False)
 def test_main_no_args_renders_state_a_and_exits(
     _mock_api_key: MagicMock,
     _mock_wizard: MagicMock,
+    _mock_persist: AsyncMock,
+    _mock_probe: AsyncMock,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -85,8 +109,9 @@ def test_main_no_args_renders_state_a_and_exits(
     assert result == EXIT_OK
     out = capsys.readouterr().out
     assert "N.O.V.A." in out
-    assert "First session. No history yet." in out
-    assert "Running setup to create your workspace modes." in out
+    # AC #1 verbatim body copy.
+    assert "First session. No history yet — that's expected." in out
+    assert "Let's set up your first workspace mode so tomorrow starts warm." in out
 
 
 def test_render_state_a_is_side_effect_only(capsys: pytest.CaptureFixture[str]) -> None:
@@ -96,7 +121,8 @@ def test_render_state_a_is_side_effect_only(capsys: pytest.CaptureFixture[str]) 
     out = capsys.readouterr().out
     # Panel title + body text must all appear.
     assert "N.O.V.A." in out
-    assert "Personal AI Session Companion" in out
+    # AC #1 verbatim — em-dash + "that's expected" clause is part of the locked copy.
+    assert "that's expected" in out
 
 
 def test_state_a_output_has_no_emoji(capsys: pytest.CaptureFixture[str]) -> None:
@@ -120,11 +146,14 @@ def test_state_a_output_has_no_exclamation_marks(capsys: pytest.CaptureFixture[s
 # --- Story 2.2: API key step wiring (AC #19-22) -----------------------------
 
 
+@_patch_story_24_helpers
 @patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=True)
 def test_main_calls_api_key_step_after_state_a(
     mock_api_key: MagicMock,
     _mock_wizard: MagicMock,
+    _mock_persist: AsyncMock,
+    _mock_probe: AsyncMock,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -139,11 +168,14 @@ def test_main_calls_api_key_step_after_state_a(
     assert "N.O.V.A." in out
 
 
+@_patch_story_24_helpers
 @patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=True)
 def test_main_exits_zero_when_key_configured(
     _mock_api: MagicMock,
     _mock_wizard: MagicMock,
+    _mock_persist: AsyncMock,
+    _mock_probe: AsyncMock,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -153,11 +185,14 @@ def test_main_exits_zero_when_key_configured(
     assert main([]) == EXIT_OK
 
 
+@_patch_story_24_helpers
 @patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=False)
 def test_main_exits_zero_when_key_skipped(
     _mock_api: MagicMock,
     _mock_wizard: MagicMock,
+    _mock_persist: AsyncMock,
+    _mock_probe: AsyncMock,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -173,6 +208,7 @@ def test_validate_only_branch_unchanged_after_story_22(tmp_path: Path) -> None:
     assert main(["--validate-only", str(tmp_path / "CON")]) == EXIT_CONFIG_ERROR
 
 
+@_patch_story_24_helpers
 @patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=False)
 @patch("nova.setup.__main__._resolve_data_dir", return_value=None)
@@ -180,6 +216,8 @@ def test_main_skips_api_key_when_localappdata_missing(
     _mock_resolve: MagicMock,
     _mock_api_key: MagicMock,
     _mock_wizard: MagicMock,
+    _mock_persist: AsyncMock,
+    _mock_probe: AsyncMock,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """When LOCALAPPDATA is not set, skip API key and mode steps gracefully."""
@@ -194,11 +232,14 @@ def test_main_skips_api_key_when_localappdata_missing(
 # --- Story 2.3: mode wizard step wiring (AC #17-19) -------------------------
 
 
+@_patch_story_24_helpers
 @patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=True)
 def test_main_calls_mode_wizard_after_api_key(
     mock_api_key: MagicMock,
     mock_wizard: MagicMock,
+    _mock_persist: AsyncMock,
+    _mock_probe: AsyncMock,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -206,8 +247,16 @@ def test_main_calls_mode_wizard_after_api_key(
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
 
     call_order: list[str] = []
-    mock_api_key.side_effect = lambda *_a, **_k: call_order.append("api_key") or True
-    mock_wizard.side_effect = lambda *_a, **_k: call_order.append("wizard")
+
+    def _api_key_side_effect(*_a: object, **_k: object) -> bool:
+        call_order.append("api_key")
+        return True
+
+    def _wizard_side_effect(*_a: object, **_k: object) -> None:
+        call_order.append("wizard")
+
+    mock_api_key.side_effect = _api_key_side_effect
+    mock_wizard.side_effect = _wizard_side_effect
 
     result = main([])
 
@@ -215,11 +264,14 @@ def test_main_calls_mode_wizard_after_api_key(
     assert call_order == ["api_key", "wizard"]
 
 
+@_patch_story_24_helpers
 @patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=False)
 def test_main_passes_same_data_dir_to_both_steps(
     mock_api_key: MagicMock,
     mock_wizard: MagicMock,
+    _mock_persist: AsyncMock,
+    _mock_probe: AsyncMock,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -233,11 +285,14 @@ def test_main_passes_same_data_dir_to_both_steps(
     assert mock_wizard.call_args[0][1] == expected_data_dir
 
 
+@_patch_story_24_helpers
 @patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=False)
 def test_main_exits_zero_when_mode_wizard_runs(
     _mock_api: MagicMock,
     _mock_wizard: MagicMock,
+    _mock_persist: AsyncMock,
+    _mock_probe: AsyncMock,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -819,3 +819,87 @@ async def test_run_migrations_delegates_to_runner(tmp_path: Path) -> None:
         assert applied_again == []
     finally:
         await engine.close()
+
+
+# --- Story 2.4: execute_returning_lastrowid -----------------------------------
+
+
+async def test_execute_returning_lastrowid_returns_autoincrement_id(
+    tmp_path: Path,
+) -> None:
+    """AC #30 — the helper returns the ``INTEGER PRIMARY KEY AUTOINCREMENT`` id."""
+    engine = SqliteStorageEngine(tmp_path / "ret.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+        first_id = await engine.execute_returning_lastrowid(
+            "INSERT INTO t (val) VALUES (?)", ("a",)
+        )
+        second_id = await engine.execute_returning_lastrowid(
+            "INSERT INTO t (val) VALUES (?)", ("b",)
+        )
+        assert first_id == 1
+        assert second_id == 2
+    finally:
+        await engine.close()
+
+
+async def test_execute_returning_lastrowid_inside_transaction_no_autocommit(
+    tmp_path: Path,
+) -> None:
+    """Transaction-aware: same-task call inside ``transaction()`` must honor ROLLBACK."""
+    engine = SqliteStorageEngine(tmp_path / "ret.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+        with pytest.raises(RuntimeError, match="boom"):
+            async with engine.transaction():
+                new_id = await engine.execute_returning_lastrowid(
+                    "INSERT INTO t (val) VALUES (?)", ("ghost",)
+                )
+                assert new_id == 1  # visible within the transaction
+                raise RuntimeError("boom")
+        rows = await engine.fetchall("SELECT val FROM t")
+        # ROLLBACK reverted the insert — the helper did NOT auto-commit.
+        assert rows == []
+    finally:
+        await engine.close()
+
+
+async def test_execute_returning_lastrowid_rejects_bare_str_params(
+    tmp_path: Path,
+) -> None:
+    engine = SqliteStorageEngine(tmp_path / "ret.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (val TEXT)")
+        with pytest.raises(StorageError, match="bare str/bytes"):
+            await engine.execute_returning_lastrowid(
+                "INSERT INTO t (val) VALUES (?)",
+                "abc",
+            )
+    finally:
+        await engine.close()
+
+
+async def test_execute_returning_lastrowid_translates_sqlite_error(
+    tmp_path: Path,
+) -> None:
+    """Same error-translation boundary as ``execute`` — generic message."""
+    engine = SqliteStorageEngine(tmp_path / "ret.db")
+    await engine.start()
+    try:
+        await engine.execute("CREATE TABLE t (val TEXT NOT NULL)")
+        with pytest.raises(StorageError, match="execute failed"):
+            # NOT NULL violation — sqlite3.IntegrityError → StorageError.
+            await engine.execute_returning_lastrowid("INSERT INTO t (val) VALUES (?)", (None,))
+    finally:
+        await engine.close()
+
+
+async def test_execute_returning_lastrowid_before_start_raises(
+    tmp_path: Path,
+) -> None:
+    engine = SqliteStorageEngine(tmp_path / "ret.db")
+    with pytest.raises(StorageError, match="not started"):
+        await engine.execute_returning_lastrowid("INSERT INTO t (val) VALUES (?)", ("a",))

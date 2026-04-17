@@ -371,6 +371,60 @@ class SqliteStorageEngine:
         except (sqlite3.Error, sqlite3.Warning, RuntimeError) as err:
             raise StorageError("execute failed") from err
 
+    async def execute_returning_lastrowid(self, sql: str, params: SqlParams = ()) -> int:
+        """Run a single INSERT and return ``cursor.lastrowid`` (AUTOINCREMENT id).
+
+        Semantics match :meth:`execute` exactly — including the
+        ``_tx_owner`` dispatch contract so calls inside an active
+        transaction on the owning task do NOT auto-commit. The ONLY
+        difference from :meth:`execute` is the return value: the
+        ``rowid`` of the most recently inserted row as reported by
+        sqlite3's ``cursor.lastrowid``.
+
+        Story 2.4 introduced this helper because the first-run setup
+        flow writes a ``sessions`` row and immediately needs its
+        ``INTEGER PRIMARY KEY AUTOINCREMENT`` id to tie the following
+        ``workspace_snapshots`` insert back. Story 3.1's
+        :class:`SqliteBrainAdapter` will reuse this surface for
+        ``create_session``; keeping it on the engine (rather than in the
+        setup seam) means Brain inherits the transaction-aware
+        behavior for free.
+
+        Raises ``StorageError`` with a generic ``"execute failed"`` on
+        any ``sqlite3.Error`` from the underlying cursor — same opaque
+        boundary as :meth:`execute`.
+        """
+        self._require_started()
+        assert self._connection is not None
+        assert self._executor is not None
+        conn = self._connection
+        executor = self._executor
+
+        _reject_scalar_string_params(params)
+        params_tuple: _SqlParamsTuple = tuple(params)
+        current = asyncio.current_task()
+        is_tx_owner = self._tx_owner is current and current is not None
+        loop = asyncio.get_running_loop()
+        try:
+            if is_tx_owner:
+                return await loop.run_in_executor(
+                    executor,
+                    self._execute_returning_lastrowid_sync_no_commit,
+                    conn,
+                    sql,
+                    params_tuple,
+                )
+            async with self._tx_lock:
+                return await loop.run_in_executor(
+                    executor,
+                    self._execute_returning_lastrowid_sync,
+                    conn,
+                    sql,
+                    params_tuple,
+                )
+        except (sqlite3.Error, sqlite3.Warning, RuntimeError) as err:
+            raise StorageError("execute failed") from err
+
     async def executemany(self, sql: str, seq_of_params: Iterable[SqlParams]) -> None:
         """Run a batch write with ``cursor.executemany`` and commit.
 
@@ -541,6 +595,36 @@ class SqliteStorageEngine:
         """Inside-transaction variant: execute without per-statement commit."""
         cursor = conn.cursor()
         cursor.execute(sql, params)
+
+    @staticmethod
+    def _execute_returning_lastrowid_sync(
+        conn: sqlite3.Connection, sql: str, params: _SqlParamsTuple
+    ) -> int:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        last = cursor.lastrowid
+        conn.commit()
+        # ``cursor.lastrowid`` is typed ``int | None``. sqlite3 returns 0
+        # when the statement did not affect any row with a rowid; we
+        # treat that as a driver-level anomaly for AUTOINCREMENT tables
+        # and translate to ``StorageError`` at the async boundary via
+        # ``sqlite3.DataError``. Story 2.4's call sites only target
+        # AUTOINCREMENT tables so in practice this branch is unreachable.
+        if last is None:
+            raise sqlite3.DataError("lastrowid is None")
+        return int(last)
+
+    @staticmethod
+    def _execute_returning_lastrowid_sync_no_commit(
+        conn: sqlite3.Connection, sql: str, params: _SqlParamsTuple
+    ) -> int:
+        """Inside-transaction variant: read lastrowid, defer commit to CM."""
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        last = cursor.lastrowid
+        if last is None:
+            raise sqlite3.DataError("lastrowid is None")
+        return int(last)
 
     @staticmethod
     def _executemany_sync(

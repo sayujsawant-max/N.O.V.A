@@ -76,6 +76,13 @@ class ActionType(StrEnum):
     ``core/audit.py`` (Story 1.8) types its API with this enum and never
     accepts raw strings. Membership is pinned by epics.md line 672 — adding
     a new action kind is a deliberate schema change, not an in-line string.
+
+    ``SETUP_COMPLETE`` joined the vocabulary via Story 2.4: it is written
+    exactly once per user when first-run setup reaches the "at least one
+    mode ready + transactional session/snapshot write succeeded"
+    milestone, and it is also the marker the
+    ``nova.setup.__main__`` fast path reads on subsequent ``setup.bat``
+    invocations to decide whether the wizard needs to run again.
     """
 
     APP_LAUNCH = "app_launch"
@@ -89,6 +96,7 @@ class ActionType(StrEnum):
     SEED_CAPTURE = "seed_capture"
     TIER_CHANGE = "tier_change"
     DATABASE_RECOVERY = "database_recovery"
+    SETUP_COMPLETE = "setup_complete"
 
 
 class MemoryCategory(StrEnum):

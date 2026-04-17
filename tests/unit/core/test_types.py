@@ -166,7 +166,22 @@ def test_action_type_exact_membership() -> None:
         "seed_capture",
         "tier_change",
         "database_recovery",
+        "setup_complete",
     }
+
+
+def test_action_type_setup_complete_value() -> None:
+    """Story 2.4 — ``SETUP_COMPLETE`` serializes as the canonical string.
+
+    The first-run flow (``nova.setup.initial_capture.persist_first_run``)
+    writes exactly one ``audit_log`` row with this action_type once setup
+    reaches the "at least one mode ready + transactional session/snapshot
+    write succeeded" milestone. The string literal is also the marker the
+    ``__main__.py`` fast path probes for on subsequent ``setup.bat``
+    invocations — changing the value is a schema-level event.
+    """
+    assert str(ActionType.SETUP_COMPLETE) == "setup_complete"
+    assert ActionType("setup_complete") is ActionType.SETUP_COMPLETE
 
 
 def test_memory_category_exact_membership() -> None:

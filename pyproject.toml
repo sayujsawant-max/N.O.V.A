@@ -48,6 +48,20 @@ mypy_path = "src"
 explicit_package_bases = true
 files = ["src/nova", "tests"]
 
+# pywin32 ships no type stubs (types-pywin32 exists but is partial and
+# third-party). Story 2.4's ``nova.setup.initial_capture`` imports
+# ``win32gui`` / ``win32process`` directly inside a guarded ``try/except
+# ImportError`` block; the adapter types never cross the setup-module
+# boundary (domain types ``WindowContext`` / ``WorkspaceSnapshot`` are
+# the only outputs). Per project-context.md:122 ("Limited exclusions
+# only for third-party integration boundaries ... documented explicitly
+# in pyproject.toml"), suppress the import-untyped noise here rather
+# than scatter ``# type: ignore[import-untyped]`` through every call
+# site. Epic 4 (Story 4.1's ``Win32EyesAdapter``) inherits this override.
+[[tool.mypy.overrides]]
+module = ["win32gui", "win32process", "pywintypes"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-17 (Story 2.3 done — 10 review patches + 2 second-pass fixes + 6 third-pass gap closures, 1137 tests passing, ruff clean)
+# last_updated: 2026-04-17 (Story 2.4 done — Briefing Card State A + initial capture + first-run persistence + completion panel; 14 review patches + 1 decision + 3 external-audit patches; 1196 unit + 23 integration green, ruff + mypy strict clean)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -63,7 +63,7 @@ development_status:
   2-1-setup-script-setup-bat: done
   2-2-api-key-configuration: done
   2-3-guided-mode-creation-wizard: done
-  2-4-briefing-card-state-a-initial-capture-and-setup-completion: backlog
+  2-4-briefing-card-state-a-initial-capture-and-setup-completion: done
   2-5-api-key-update-post-setup: backlog
   epic-2-retrospective: optional
 
