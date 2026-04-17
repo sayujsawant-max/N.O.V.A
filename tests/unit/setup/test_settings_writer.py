@@ -109,9 +109,7 @@ class TestCorruptYamlTranslation:
     def test_malformed_yaml_raises_oserror(self, tmp_path: Path) -> None:
         """H6: yaml.YAMLError from parse failure is re-raised as OSError."""
         data_dir = tmp_path
-        (data_dir / "settings.yaml").write_text(
-            "bluntness: [unclosed\n", encoding="utf-8"
-        )
+        (data_dir / "settings.yaml").write_text("bluntness: [unclosed\n", encoding="utf-8")
 
         with pytest.raises(OSError) as excinfo:
             write_api_key(data_dir, "sk-ant-key")
@@ -124,9 +122,7 @@ class TestCorruptYamlTranslation:
     def test_list_root_raises_oserror(self, tmp_path: Path) -> None:
         """H7: list root (instead of mapping) raises OSError, not TypeError."""
         data_dir = tmp_path
-        (data_dir / "settings.yaml").write_text(
-            "- first\n- second\n", encoding="utf-8"
-        )
+        (data_dir / "settings.yaml").write_text("- first\n- second\n", encoding="utf-8")
 
         with pytest.raises(OSError, match="not a mapping"):
             write_api_key(data_dir, "sk-ant-key")
@@ -142,9 +138,7 @@ class TestCorruptYamlTranslation:
     def test_key_not_in_translated_exception_messages(self, tmp_path: Path) -> None:
         """The translated OSError never embeds the API key value."""
         data_dir = tmp_path
-        (data_dir / "settings.yaml").write_text(
-            "bluntness: [bad\n", encoding="utf-8"
-        )
+        (data_dir / "settings.yaml").write_text("bluntness: [bad\n", encoding="utf-8")
 
         secret = "sk-ant-never-leak-this"
         try:

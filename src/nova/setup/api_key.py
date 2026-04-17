@@ -103,9 +103,7 @@ def _ping_anthropic(api_key: str) -> ValidationOutcome:
         except (anthropic.APIConnectionError, anthropic.APITimeoutError):
             return ValidationOutcome(ValidationResult.NETWORK_ERROR)
         except anthropic.RateLimitError as err:
-            return ValidationOutcome(
-                ValidationResult.RATE_LIMITED, status_code=err.status_code
-            )
+            return ValidationOutcome(ValidationResult.RATE_LIMITED, status_code=err.status_code)
         except anthropic.APIStatusError as err:
             logger.debug(
                 "API status error during key validation",
@@ -122,9 +120,7 @@ def _ping_anthropic(api_key: str) -> ValidationOutcome:
             # problem on our side.  The "key may be valid — try again
             # or skip" wording plus the status code is accurate for
             # both 4xx-non-auth and 5xx.
-            return ValidationOutcome(
-                ValidationResult.SERVER_ERROR, status_code=err.status_code
-            )
+            return ValidationOutcome(ValidationResult.SERVER_ERROR, status_code=err.status_code)
         except anthropic.APIError:
             # Catch-all for APIError / APIResponseValidationError /
             # any future subclass that doesn't extend APIStatusError.
@@ -272,9 +268,7 @@ def run_api_key_step(console: Console, data_dir: Path) -> bool:
                     # notice above already explains that verification
                     # was skipped.  Printing "API key validated." here
                     # would contradict that and mislead the user.
-                    console.print(
-                        "[yellow]\u26a0[/yellow] API key saved (unverified)."
-                    )
+                    console.print("[yellow]\u26a0[/yellow] API key saved (unverified).")
                     return True
                 return False
 

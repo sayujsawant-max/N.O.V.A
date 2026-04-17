@@ -48,9 +48,7 @@ class _FStringInterpolationVisitor(ast.NodeVisitor):
         # so we recurse and flag any contained Name that matches.
         for sub in ast.walk(node.value):
             if isinstance(sub, ast.Name) and sub.id in _KEY_VAR_NAMES:
-                self.findings.append(
-                    (node.lineno, f"f-string interpolates {sub.id!r}")
-                )
+                self.findings.append((node.lineno, f"f-string interpolates {sub.id!r}"))
         self.generic_visit(node)
 
 
@@ -79,9 +77,7 @@ class _PrintCallVisitor(ast.NodeVisitor):
                 if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mod):
                     rhs = sub.right
                     if isinstance(rhs, ast.Name) and rhs.id in _KEY_VAR_NAMES:
-                        self.findings.append(
-                            (node.lineno, f"%-formatting with {rhs.id!r}")
-                        )
+                        self.findings.append((node.lineno, f"%-formatting with {rhs.id!r}"))
         self.generic_visit(node)
 
 
@@ -94,10 +90,7 @@ class _FormatMethodVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         # Match `<str>.format(...)` where <str> is a string literal
         # or a Name — we care only about the args passed.
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "format"
-        ):
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "format":
             for arg in node.args:
                 if isinstance(arg, ast.Name) and arg.id in _KEY_VAR_NAMES:
                     self.findings.append(

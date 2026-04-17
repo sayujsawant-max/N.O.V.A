@@ -70,9 +70,11 @@ def test_main_validate_only_exits_one_on_invalid(tmp_path: Path) -> None:
 # --- State A rendering (AC #41) --------------------------------------------
 
 
+@patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=False)
 def test_main_no_args_renders_state_a_and_exits(
     _mock_api_key: MagicMock,
+    _mock_wizard: MagicMock,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -118,9 +120,11 @@ def test_state_a_output_has_no_exclamation_marks(capsys: pytest.CaptureFixture[s
 # --- Story 2.2: API key step wiring (AC #19-22) -----------------------------
 
 
+@patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=True)
 def test_main_calls_api_key_step_after_state_a(
     mock_api_key: MagicMock,
+    _mock_wizard: MagicMock,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -135,9 +139,11 @@ def test_main_calls_api_key_step_after_state_a(
     assert "N.O.V.A." in out
 
 
+@patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=True)
 def test_main_exits_zero_when_key_configured(
-    _mock: MagicMock,
+    _mock_api: MagicMock,
+    _mock_wizard: MagicMock,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -147,9 +153,11 @@ def test_main_exits_zero_when_key_configured(
     assert main([]) == EXIT_OK
 
 
+@patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=False)
 def test_main_exits_zero_when_key_skipped(
-    _mock: MagicMock,
+    _mock_api: MagicMock,
+    _mock_wizard: MagicMock,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -165,16 +173,74 @@ def test_validate_only_branch_unchanged_after_story_22(tmp_path: Path) -> None:
     assert main(["--validate-only", str(tmp_path / "CON")]) == EXIT_CONFIG_ERROR
 
 
+@patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
 @patch("nova.setup.__main__.run_api_key_step", return_value=False)
 @patch("nova.setup.__main__._resolve_data_dir", return_value=None)
 def test_main_skips_api_key_when_localappdata_missing(
     _mock_resolve: MagicMock,
     _mock_api_key: MagicMock,
+    _mock_wizard: MagicMock,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """When LOCALAPPDATA is not set, skip API key step gracefully."""
+    """When LOCALAPPDATA is not set, skip API key and mode steps gracefully."""
     result = main([])
     assert result == EXIT_OK
     _mock_api_key.assert_not_called()
+    _mock_wizard.assert_not_called()
     out = capsys.readouterr().out
     assert "LOCALAPPDATA" in out
+
+
+# --- Story 2.3: mode wizard step wiring (AC #17-19) -------------------------
+
+
+@patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
+@patch("nova.setup.__main__.run_api_key_step", return_value=True)
+def test_main_calls_mode_wizard_after_api_key(
+    mock_api_key: MagicMock,
+    mock_wizard: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``main([])`` calls ``run_mode_wizard_step`` after ``run_api_key_step``."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    call_order: list[str] = []
+    mock_api_key.side_effect = lambda *_a, **_k: call_order.append("api_key") or True
+    mock_wizard.side_effect = lambda *_a, **_k: call_order.append("wizard")
+
+    result = main([])
+
+    assert result == EXIT_OK
+    assert call_order == ["api_key", "wizard"]
+
+
+@patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
+@patch("nova.setup.__main__.run_api_key_step", return_value=False)
+def test_main_passes_same_data_dir_to_both_steps(
+    mock_api_key: MagicMock,
+    mock_wizard: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both steps receive the resolved ``LOCALAPPDATA/nova`` path."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    main([])
+
+    expected_data_dir = tmp_path / "nova"
+    assert mock_api_key.call_args[0][1] == expected_data_dir
+    assert mock_wizard.call_args[0][1] == expected_data_dir
+
+
+@patch("nova.setup.__main__.run_mode_wizard_step", return_value=None)
+@patch("nova.setup.__main__.run_api_key_step", return_value=False)
+def test_main_exits_zero_when_mode_wizard_runs(
+    _mock_api: MagicMock,
+    _mock_wizard: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exit code stays 0 after mode wizard runs (AC #19)."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert main([]) == EXIT_OK

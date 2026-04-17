@@ -36,6 +36,7 @@ from rich.text import Text
 from nova.core.exceptions import ConfigError
 from nova.core.paths import validate_data_dir
 from nova.setup.api_key import run_api_key_step
+from nova.setup.mode_wizard import run_mode_wizard_step
 
 
 def _force_utf8_stdout() -> None:
@@ -145,12 +146,14 @@ def main(argv: list[str] | None = None) -> int:
     _render_state_a(console)
 
     # Story 2.2: API key configuration step
+    # Story 2.3: guided mode creation wizard
     data_dir = _resolve_data_dir()
     if data_dir is not None:
         run_api_key_step(console, data_dir)
+        run_mode_wizard_step(console, data_dir)
     else:
         console.print(
-            "[yellow]\u26a0[/yellow] LOCALAPPDATA not set. Skipping API key configuration."
+            "[yellow]\u26a0[/yellow] LOCALAPPDATA not set. Skipping API key and mode configuration."
         )
 
     return EXIT_OK

@@ -531,9 +531,7 @@ class TestPostReviewPatches:
         )
 
     @patch("nova.setup.api_key.validate_api_key")
-    def test_success_still_claims_validated(
-        self, mock_validate: MagicMock, data_dir: Path
-    ) -> None:
+    def test_success_still_claims_validated(self, mock_validate: MagicMock, data_dir: Path) -> None:
         """Regression: SUCCESS path still prints 'API key validated.'."""
         mock_validate.return_value = _outcome(ValidationResult.SUCCESS)
         console = _make_console("sk-ant-key")

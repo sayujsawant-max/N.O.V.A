@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-16 (Story 2.2 done — 18 review patches applied total, 7 deferred, 970 tests passing)
+# last_updated: 2026-04-17 (Story 2.3 done — 10 review patches + 2 second-pass fixes + 6 third-pass gap closures, 1137 tests passing, ruff clean)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-14
-last_updated: 2026-04-16
+last_updated: 2026-04-17
 project: AI Assistant
 project_key: NOKEY
 tracking_system: file-system
@@ -62,7 +62,7 @@ development_status:
   epic-2: in-progress
   2-1-setup-script-setup-bat: done
   2-2-api-key-configuration: done
-  2-3-guided-mode-creation-wizard: backlog
+  2-3-guided-mode-creation-wizard: done
   2-4-briefing-card-state-a-initial-capture-and-setup-completion: backlog
   2-5-api-key-update-post-setup: backlog
   epic-2-retrospective: optional

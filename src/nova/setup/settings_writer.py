@@ -52,9 +52,7 @@ def write_api_key(data_dir: Path, api_key: str) -> None:
             # covers corrupt/hand-edited settings.yaml.  Message
             # intentionally does not echo file content — only the
             # path, which the OS layer also exposes.
-            raise OSError(
-                f"settings.yaml is not valid YAML: {settings_path}"
-            ) from err
+            raise OSError(f"settings.yaml is not valid YAML: {settings_path}") from err
 
     if loaded is None:
         data: dict[str, object] = {}
@@ -63,9 +61,7 @@ def write_api_key(data_dir: Path, api_key: str) -> None:
     else:
         # List / scalar / other — `data["api_key"] = ...` would raise
         # TypeError.  Reject with OSError to match caller contract.
-        raise OSError(
-            f"settings.yaml root is not a mapping: {settings_path}"
-        )
+        raise OSError(f"settings.yaml root is not a mapping: {settings_path}")
 
     data["api_key"] = api_key
 

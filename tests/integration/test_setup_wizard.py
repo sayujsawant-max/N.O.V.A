@@ -219,6 +219,11 @@ class TestFullWiringThroughMain:
             "rich.console.Console.input",
             lambda self, *_args, **_kwargs: "sk-ant-e2e-real-wiring",
         )
+        # Mode wizard is out of scope for this Story 2.2 test — mock to no-op.
+        monkeypatch.setattr(
+            "nova.setup.__main__.run_mode_wizard_step",
+            lambda *_a, **_k: None,
+        )
 
         # Act
         exit_code = main([])
@@ -247,15 +252,18 @@ class TestFullWiringThroughMain:
 
         nova_dir = tmp_path / "nova"
         nova_dir.mkdir()
-        (nova_dir / "settings.yaml").write_text(
-            "bluntness: direct\n", encoding="utf-8"
-        )
+        (nova_dir / "settings.yaml").write_text("bluntness: direct\n", encoding="utf-8")
         monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
 
         monkeypatch.setattr("nova.setup.api_key.sys.stdin.isatty", lambda: True)
         monkeypatch.setattr(
             "rich.console.Console.input",
             lambda self, *_args, **_kwargs: "skip",
+        )
+        # Mode wizard is out of scope for this test — mock it to a no-op.
+        monkeypatch.setattr(
+            "nova.setup.__main__.run_mode_wizard_step",
+            lambda *_a, **_k: None,
         )
 
         exit_code = main([])
@@ -267,3 +275,120 @@ class TestFullWiringThroughMain:
         settings = yaml.safe_load((nova_dir / "settings.yaml").read_text(encoding="utf-8"))
         assert "api_key" not in settings
         mock_validate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Story 2.3: Full wiring through main() — State A → API key → mode wizard
+# ---------------------------------------------------------------------------
+
+
+class TestModeWizardWiring:
+    """main() reaches the mode wizard and writes a mode file end-to-end (AC #17, #24)."""
+
+    @patch("nova.setup.api_key.validate_api_key")
+    def test_main_runs_full_setup_and_writes_mode_from_template(
+        self,
+        mock_validate: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """User configures API key then accepts the shipped coding template."""
+        from nova.setup.__main__ import EXIT_OK, main
+
+        nova_dir = tmp_path / "nova"
+        nova_dir.mkdir()
+        (nova_dir / "settings.yaml").write_text("bluntness: direct\n", encoding="utf-8")
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+        # Point the template locator at an isolated source dir with one template
+        templates = tmp_path / "fake_templates"
+        templates.mkdir()
+        (templates / "coding.yaml").write_text(
+            "name: coding\napps:\n  - name: VS Code\n    executable: code\n    args: []\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "nova.setup.mode_wizard._locate_shipped_templates",
+            lambda: templates,
+        )
+
+        mock_validate.return_value = ValidationOutcome(ValidationResult.SUCCESS)
+        monkeypatch.setattr("nova.setup.api_key.sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("nova.setup.mode_wizard.sys.stdin.isatty", lambda: True)
+
+        scripted_inputs = iter(
+            [
+                "sk-ant-integration",  # API key
+                "accept",  # accept the coding template
+                "n",  # no additional custom mode
+            ]
+        )
+        monkeypatch.setattr(
+            "rich.console.Console.input",
+            lambda self, *_args, **_kwargs: next(scripted_inputs),
+        )
+
+        exit_code = main([])
+
+        assert exit_code == EXIT_OK
+
+        # API key persisted
+        settings = yaml.safe_load((nova_dir / "settings.yaml").read_text(encoding="utf-8"))
+        assert settings["api_key"] == "sk-ant-integration"
+
+        # Mode file persisted (verbatim — Path A)
+        modes_dir = nova_dir / "modes"
+        assert (modes_dir / "coding.yaml").exists()
+        written = (modes_dir / "coding.yaml").read_text(encoding="utf-8")
+        assert "name: coding" in written
+        assert "executable: code" in written
+
+    @patch("nova.setup.api_key.validate_api_key")
+    def test_main_writes_custom_mode_when_no_templates(
+        self,
+        mock_validate: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No templates available → custom mode path exercised end-to-end."""
+        from nova.setup.__main__ import EXIT_OK, main
+
+        nova_dir = tmp_path / "nova"
+        nova_dir.mkdir()
+        (nova_dir / "settings.yaml").write_text("bluntness: direct\n", encoding="utf-8")
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+        # No templates directory
+        monkeypatch.setattr("nova.setup.mode_wizard._locate_shipped_templates", lambda: None)
+
+        mock_validate.return_value = ValidationOutcome(ValidationResult.SUCCESS)
+        monkeypatch.setattr("nova.setup.api_key.sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("nova.setup.mode_wizard.sys.stdin.isatty", lambda: True)
+
+        scripted_inputs = iter(
+            [
+                "sk-ant-integration",  # API key
+                "y",  # yes, create custom mode
+                "study",  # mode name
+                "Notion",  # first app
+                "done",  # finish apps
+                "",  # skip folders
+                "",  # skip urls
+                "y",  # save
+                "n",  # no more custom modes
+            ]
+        )
+        monkeypatch.setattr(
+            "rich.console.Console.input",
+            lambda self, *_args, **_kwargs: next(scripted_inputs),
+        )
+
+        exit_code = main([])
+
+        assert exit_code == EXIT_OK
+        mode_file = nova_dir / "modes" / "study.yaml"
+        assert mode_file.exists()
+        parsed = yaml.safe_load(mode_file.read_text(encoding="utf-8"))
+        assert parsed["name"] == "study"
+        assert parsed["apps"] == [{"name": "Notion", "executable": "notion", "args": []}]
