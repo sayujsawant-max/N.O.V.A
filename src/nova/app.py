@@ -153,10 +153,26 @@ async def create_app(
         audit = AuditLogger(storage=storage)
         logger.info("audit logger wired")
 
+        # Story 2.5 AC #4 — initial tier is derived from ``config.api_key``.
+        # Absent key (None, empty, whitespace-only, non-string — all
+        # normalized to ``None`` by ``_normalize_api_key``) → OFFLINE.
+        # Present key → FULL (optimistic; the first real cloud call is what
+        # would proof-test validity — Story 3.5 owns that degradation).
+        initial_tier = (
+            CapabilityTier.OFFLINE if config.api_key is None else CapabilityTier.FULL
+        )
+        if initial_tier is CapabilityTier.OFFLINE:
+            # Opacity: ``reason`` is a closed-set string; the key value is
+            # never logged — only its absence as a category label.
+            logger.info(
+                "starting in offline-local-only tier (no API key configured)",
+                extra={"reason": "no_api_key"},
+            )
+
         tier_manager = TierManager(
             health_check=_AlwaysHealthyCheck(),
             event_bus=event_bus,
-            initial_tier=CapabilityTier.FULL,
+            initial_tier=initial_tier,
         )
         logger.info("tier manager constructed", extra={"initial_tier": str(tier_manager.tier)})
 

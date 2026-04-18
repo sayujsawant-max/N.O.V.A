@@ -102,6 +102,20 @@ _VALID_LOG_LEVELS: Final[Mapping[str, int]] = {
 }
 
 
+# Story 2.5 AC #11 — ``nova --help`` epilog documenting the post-setup
+# key-update path. Uses ``argparse.RawDescriptionHelpFormatter`` on the
+# parser so indentation and line breaks survive verbatim. Text uses the
+# literal ``%LOCALAPPDATA%`` env-var form (not a resolved path) so the
+# help output does not leak the username.
+_HELP_EPILOG: Final[str] = (
+    "API key:\n"
+    "  To add or update your Anthropic API key, edit:\n"
+    "      %LOCALAPPDATA%/nova/settings.yaml\n"
+    "  Change the `api_key:` line, save, and re-run `nova`.\n"
+    "  Removing the line starts N.O.V.A. in offline-local-only tier.\n"
+)
+
+
 def _parse_log_level(cli_raw: str | None, env_raw: str | None) -> int:
     """Resolve the log level. CLI flag > env var > default (INFO).
 
@@ -235,6 +249,62 @@ def _configure_stderr_logging(level: int) -> None:
     root.setLevel(level)
 
 
+def _emit_offline_notice_once(api_key: str | None) -> None:
+    """Story 2.5 AC #7, #8, #9, #10 — one-time offline notice on cli startup.
+
+    Emits a single amber stderr line when ``api_key is None`` so the user
+    knows they booted without cloud reasoning. Silent when the key is
+    present. Called at Step 6.5 of the ``_async_main`` bootstrap (after
+    the ``"N.O.V.A. initialized"`` success log, before the session
+    placeholder log) — see the module docstring for the full sequence.
+
+    Why direct ``sys.stderr.write`` instead of ``logger.warning``:
+    by Step 6.5 the Phase A stderr handler has been torn down
+    (:func:`_configure_file_logging` removes it). A ``logger.warning``
+    call would reach only the file logger, so the user wouldn't see it
+    at the terminal. The direct-write approach matches the
+    pre-logger ``ConfigError`` surface in :func:`main` at the top of the
+    module, keeps the two-phase logger state invariant unchanged, and
+    lets Skin re-home this notice cleanly when it arrives (Story 3.3 /
+    Story 5.4).
+
+    Opacity: the notice text is fully static — it never interpolates
+    the caller's ``api_key`` value, never echoes a redacted form, never
+    embeds a resolved user path (``%LOCALAPPDATA%`` stays in its
+    env-var form so we don't leak ``C:\\Users\\<username>\\...``).
+
+    Failure handling (review patch): the notice is best-effort. On a
+    Windows console running cp1252/cp437 without ``PYTHONIOENCODING=utf-8``
+    the ``\\u26a0`` glyph triggers ``UnicodeEncodeError``; a detached or
+    closed stderr raises ``BrokenPipeError`` / ``ValueError``. None of
+    those should promote ``EXIT_OK`` to ``EXIT_UNEXPECTED`` — bootstrap
+    already succeeded by the time this helper runs. The write is wrapped
+    in a narrow exception handler that logs to Phase B's file logger
+    (``nova.log``) so the operator still sees something, and the caller
+    returns normally.
+    """
+    if api_key is not None:
+        return
+    notice = (
+        "\u26a0 Cloud reasoning unavailable. Running in "
+        "offline-local-only tier. To add or update your API key, "
+        "edit %LOCALAPPDATA%/nova/settings.yaml and re-run nova.\n"
+    )
+    try:
+        sys.stderr.write(notice)
+        sys.stderr.flush()
+    except (UnicodeEncodeError, OSError, ValueError):
+        # OSError covers BrokenPipeError (stderr piped to a dead reader)
+        # and generic write failures; ValueError covers a closed stream
+        # (``I/O operation on closed file``). The file logger is still
+        # attached at Step 6.5 so the fallback gets persisted — operator
+        # forensics survive even when the terminal can't render the glyph.
+        logger.warning(
+            "offline notice could not be written to stderr — falling back to file log",
+            exc_info=True,
+        )
+
+
 def _configure_file_logging(data_dir: Path, level: int) -> None:
     """Attach the file handler and remove the Phase A stderr handler.
 
@@ -275,6 +345,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nova",
         description="N.O.V.A. — local-first Windows workspace assistant.",
+        # Story 2.5 AC #11 — RawDescriptionHelpFormatter preserves the
+        # indentation and line breaks in ``_HELP_EPILOG``. The default
+        # ``HelpFormatter`` rewraps the epilog into a single block,
+        # which collapses the two-space indent under "API key:" and
+        # renders the file-path line unreadable at 80 columns.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_HELP_EPILOG,
     )
     parser.add_argument(
         "--data-dir",
@@ -372,6 +449,13 @@ async def _async_main(args: argparse.Namespace) -> int:
                 "tier": str(app.tier_manager.tier),
             },
         )
+        # Step 6.5 (Story 2.5 AC #7, #10): one-time offline notice. Fires
+        # only when ``config.api_key is None``; silent otherwise. Must land
+        # AFTER the success log (so the file log shows bootstrap succeeded
+        # before the consequence is surfaced) and BEFORE the placeholder
+        # log so a human scanning stderr sees the notice without having to
+        # tail nova.log.
+        _emit_offline_notice_once(config.api_key)
         # Step 7: placeholder session boot. Epic 3+ replaces this with
         # the real session loop.
         logger.info("session shell placeholder — full session loop arrives in Story 3.5")

@@ -24,15 +24,22 @@ from nova.core.exceptions import StorageError
 from nova.core.types import ActionType
 
 
-def _build_config(tmp_path: Path) -> NovaConfig:
-    """Minimal valid :class:`NovaConfig` anchored at ``tmp_path``."""
+def _build_config(tmp_path: Path, *, api_key: str | None = "sk-ant-test") -> NovaConfig:
+    """Minimal valid :class:`NovaConfig` anchored at ``tmp_path``.
+
+    Story 2.5 AC #4 — ``create_app`` derives ``initial_tier`` from
+    ``config.api_key`` (None → OFFLINE, present → FULL). The shared
+    helper defaults to a present test key so existing Story 1.10 shape
+    tests continue to exercise the FULL-tier happy path; tests that need
+    the OFFLINE-tier path pass ``api_key=None`` explicitly.
+    """
     return NovaConfig(
         db_path=tmp_path / "nova.db",
         data_dir=tmp_path,
         modes={},
         exclusions=ExclusionConfig(),
         settings=UserSettings(),
-        api_key=None,
+        api_key=api_key,
     )
 
 
@@ -337,3 +344,122 @@ async def test_create_app_idempotent_on_same_db(tmp_path: Path) -> None:
         assert row["count"] >= 1
     finally:
         await second.close()
+
+
+# --- Story 2.5 AC #4, #5, #6, #16 — initial-tier derivation from api_key ---
+
+
+async def test_initial_tier_is_offline_when_api_key_is_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Story 2.5 AC #4, #5 — absent key → OFFLINE tier + canonical INFO log."""
+    config = _build_config(tmp_path, api_key=None)
+    with caplog.at_level("INFO", logger="nova.app"):
+        app = await create_app(config)
+    try:
+        assert app.tier_manager.tier is CapabilityTier.OFFLINE
+        offline_records = [
+            rec
+            for rec in caplog.records
+            if rec.name == "nova.app"
+            and "starting in offline-local-only tier" in rec.message
+        ]
+        assert len(offline_records) == 1
+        # ``reason`` is injected via ``extra={"reason": "no_api_key"}`` — it
+        # lives on the LogRecord as a dynamic attribute that mypy can't
+        # statically verify; ``vars(rec)`` is the mypy-friendly read path.
+        assert vars(offline_records[0]).get("reason") == "no_api_key"
+    finally:
+        await app.close()
+
+
+async def test_initial_tier_is_full_when_api_key_is_present(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Story 2.5 AC #4, #6 — present key → FULL tier, no extra log line."""
+    config = _build_config(tmp_path, api_key="sk-ant-present")
+    with caplog.at_level("INFO", logger="nova.app"):
+        app = await create_app(config)
+    try:
+        assert app.tier_manager.tier is CapabilityTier.FULL
+        # AC #6 — no new "starting in offline" log when the key is present.
+        assert not any(
+            "starting in offline-local-only tier" in rec.message
+            for rec in caplog.records
+        )
+    finally:
+        await app.close()
+
+
+async def test_initial_tier_is_offline_when_api_key_is_empty_string_after_load_config(
+    tmp_path: Path,
+) -> None:
+    """Story 2.5 AC #4 end-to-end — ``load_config`` normalizes ``""`` → ``None``,
+    which ``create_app`` routes to OFFLINE.
+
+    This closes the restart-picks-up-change contract: a user editing
+    ``settings.yaml`` to clear the key value (``api_key: ""``) sees
+    OFFLINE tier on the next ``nova`` run.
+    """
+    from nova.core.config import load_config
+
+    (tmp_path / "settings.yaml").write_text('api_key: ""\n', encoding="utf-8")
+    (tmp_path / "modes").mkdir()
+    loaded = load_config(tmp_path)
+    # Sanity check — the config loader normalizes empty → None (Story 2.2).
+    assert loaded.api_key is None
+    app = await create_app(loaded)
+    try:
+        assert app.tier_manager.tier is CapabilityTier.OFFLINE
+    finally:
+        await app.close()
+
+
+async def test_create_app_does_not_echo_the_api_key_in_any_log_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Story 2.5 AC #14, #16 — the key value must never appear in any log record.
+
+    Uses a distinctive sentinel so a substring check is unambiguous. A
+    future edit that adds ``extra={"api_key": config.api_key}`` or
+    interpolates the key into a message string would fail this guard.
+    """
+    sentinel = "sk-ant-VERYSECRETUNIQUE12345"
+    config = _build_config(tmp_path, api_key=sentinel)
+    with caplog.at_level("DEBUG"):
+        app = await create_app(config)
+    try:
+        for rec in caplog.records:
+            assert sentinel not in rec.getMessage(), (
+                f"API key leaked into log message on logger={rec.name!r}"
+            )
+            for value in rec.__dict__.values():
+                assert sentinel not in repr(value), (
+                    f"API key leaked into log extras on logger={rec.name!r}"
+                )
+    finally:
+        await app.close()
+
+
+async def test_tier_stays_offline_without_recovery_loop(tmp_path: Path) -> None:
+    """Story 2.5 Dev Notes — Story 1.10's ``create_app`` does NOT start
+    ``tier_manager.run_recovery_loop()``; Nerve (Story 3.5) owns that. For
+    the duration of a ``nova`` invocation that boots with no API key, the
+    initial OFFLINE tier must persist.
+
+    This is a behavioral smoke test — if a future refactor starts the
+    recovery loop inside ``create_app``, the ``_AlwaysHealthyCheck`` stub
+    would trip the tier back to FULL on the first tick, silently breaking
+    the Story 2.5 posture.
+    """
+    import asyncio
+
+    config = _build_config(tmp_path, api_key=None)
+    app = await create_app(config)
+    try:
+        assert app.tier_manager.tier is CapabilityTier.OFFLINE
+        # Yield once to let any (unintended) background task run.
+        await asyncio.sleep(0)
+        assert app.tier_manager.tier is CapabilityTier.OFFLINE
+    finally:
+        await app.close()

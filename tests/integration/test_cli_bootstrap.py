@@ -43,8 +43,15 @@ def nova_data_dir(tmp_path: Path) -> Path:
     does NOT emit WARNING records during boot — the happy-path test
     asserts an empty stderr, so leaving config files absent would trip
     on legitimate "zero modes / no exclusions" warnings.
+
+    Story 2.5 AC #7 — the fixture also seeds a test ``api_key`` so the
+    one-time offline notice does NOT fire. The happy-path test asserts
+    empty stderr; without a key we'd now trip the notice. Tests that
+    want to exercise the no-key path override this file explicitly.
     """
-    (tmp_path / "settings.yaml").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "settings.yaml").write_text(
+        'api_key: "sk-ant-test-bootstrap"\n', encoding="utf-8"
+    )
     (tmp_path / "exclusions.yaml").write_text("{}\n", encoding="utf-8")
     # Seed a single valid mode so the "zero modes" warning stays silent.
     modes_dir = tmp_path / "modes"

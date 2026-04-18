@@ -573,6 +573,58 @@ def test_api_key_whitespace_normalizes_to_none(tmp_path: Path) -> None:
     assert config.api_key is None
 
 
+# --- Story 2.5 AC #3 — _normalize_api_key behavior lock --------------------
+
+
+@pytest.mark.parametrize(
+    ("yaml_body", "expected"),
+    [
+        # Normal key — untouched.
+        ('api_key: "sk-ant-abc"\n', "sk-ant-abc"),
+        # Surrounding whitespace stripped (YAML `api_key: " sk-ant-abc "`
+        # would otherwise fail Anthropic auth).
+        ('api_key: " sk-ant-abc "\n', "sk-ant-abc"),
+        # Empty string → None.
+        ('api_key: ""\n', None),
+        # Whitespace-only → None.
+        ("api_key: '   '\n", None),
+        # YAML null (``api_key:`` with no value) → None.
+        ("api_key:\n", None),
+        # Integer literal — non-string types silently normalize to None
+        # per Story 2.2 _normalize_api_key.
+        ("api_key: 123\n", None),
+        # List literal — non-string types silently normalize to None.
+        ("api_key: [sk-ant-abc]\n", None),
+    ],
+    ids=[
+        "plain_string",
+        "strips_surrounding_whitespace",
+        "empty_string_is_none",
+        "whitespace_only_is_none",
+        "yaml_null_is_none",
+        "int_is_none",
+        "list_is_none",
+    ],
+)
+def test_normalize_api_key_variants(
+    tmp_path: Path, yaml_body: str, expected: str | None
+) -> None:
+    """Story 2.5 AC #3 — lock the ``_normalize_api_key`` contract."""
+    data_dir = _bootstrap_data_dir(tmp_path)
+    _write(data_dir / "settings.yaml", yaml_body)
+    config = load_config(data_dir)
+    assert config.api_key == expected
+
+
+def test_normalize_api_key_absent_key_is_none(tmp_path: Path) -> None:
+    """Story 2.5 AC #3 — the YAML key being absent entirely normalizes to None."""
+    data_dir = _bootstrap_data_dir(tmp_path)
+    # File present but empty mapping — no ``api_key:`` line at all.
+    _write(data_dir / "settings.yaml", "bluntness: direct\n")
+    config = load_config(data_dir)
+    assert config.api_key is None
+
+
 def test_briefing_threshold_zero_accepted(tmp_path: Path) -> None:
     data_dir = _bootstrap_data_dir(tmp_path)
     _write(data_dir / "settings.yaml", "briefing_recency_threshold_minutes: 0\n")

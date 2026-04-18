@@ -16,10 +16,12 @@ import pytest
 
 from nova.cli import (
     _FILE_HANDLER_NAME,
+    _HELP_EPILOG,
     _STDERR_HANDLER_NAME,
     EXIT_CONFIG_ERROR,
     _async_main,
     _build_formatter,
+    _build_parser,
     _configure_file_logging,
     _configure_stderr_logging,
     _parse_log_level,
@@ -398,3 +400,51 @@ async def test_async_main_validate_data_dir_success_continues_bootstrap(
     mock_load.assert_called_once_with(tmp_path.resolve())
     mock_phase_b.assert_not_called()
     mock_create_app.assert_not_called()
+
+
+# --- Story 2.5 AC #11, #18 — help epilog documents the key-update path ------
+
+
+def test_help_epilog_documents_key_update_path() -> None:
+    """AC #18 — ``nova --help`` contains the three substring markers in order
+    and uses :class:`argparse.RawDescriptionHelpFormatter` so indentation
+    survives.
+    """
+    parser = _build_parser()
+
+    # Formatter class is ``RawDescriptionHelpFormatter`` so the
+    # ``_HELP_EPILOG`` newlines and two-space indentation render intact.
+    # ``parser.formatter_class`` is typed as argparse's private
+    # ``_FormatterClass`` alias — identity check against the concrete
+    # class is both simpler than ``issubclass`` and strict-mypy clean.
+    assert parser.formatter_class is argparse.RawDescriptionHelpFormatter
+
+    help_text = parser.format_help()
+
+    # Ordered substring check — each marker appears exactly once and in
+    # the expected relative order.
+    markers = (
+        "API key:",
+        "%LOCALAPPDATA%/nova/settings.yaml",
+        "re-run `nova`",
+    )
+    previous_idx = -1
+    for marker in markers:
+        idx = help_text.find(marker)
+        assert idx >= 0, f"missing epilog marker: {marker!r}"
+        assert idx > previous_idx, f"epilog markers out of order at {marker!r}"
+        # Exactly one occurrence per marker.
+        assert help_text.count(marker) == 1, f"{marker!r} should appear exactly once"
+        previous_idx = idx
+
+
+def test_help_epilog_constant_is_referenced_in_parser() -> None:
+    """Defense in depth — the module-level ``_HELP_EPILOG`` constant is the
+    single source of truth; the parser's help output must contain it
+    verbatim (so a refactor that forks the string between two places
+    fails this test).
+    """
+    parser = _build_parser()
+    help_text = parser.format_help()
+    # The full constant appears as one contiguous block in the output.
+    assert _HELP_EPILOG.strip() in help_text
