@@ -53,8 +53,12 @@ jobs:
       - name: Type check (mypy)
         run: uv run mypy src/ tests/
 
+      # Coverage floor set per Epic 2 retro action A5 (2026-04-18). Baseline at A5 resolution
+      # was 90.1% (unit-test layer only); 88 gives a 2pp buffer for normal variance while
+      # still catching material regressions. Raise the floor in a future retro when the
+      # real system modules (Brain/Nerve/Ritual/Skin) ship and the baseline stabilizes.
       - name: Unit tests
-        run: uv run pytest tests/unit/ --cov=nova --cov-report=term --cov-report=xml
+        run: uv run pytest tests/unit/ --cov=nova --cov-report=term --cov-report=xml --cov-fail-under=88
 
       - name: Integration tests
         run: uv run pytest tests/integration/

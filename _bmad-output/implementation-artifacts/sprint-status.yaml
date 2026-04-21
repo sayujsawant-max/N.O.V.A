@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-17 (Story 2.5 done — API key update post-setup: 9 tasks + 9 review patches applied + 7 review deferrals tracked. 1231 unit + 49 integration green, ruff + mypy strict clean.)
+# last_updated: 2026-04-18 (Epic 2 retro done; all 3 critical-path items cleared same-day — A5 coverage floor wired at --cov-fail-under=88 (baseline 90.1%); Story 3.1 prep file authored with full A6 + A10 sections; Stories 3.2/3.3/3.5 pre-flag file authored with A6 classifications. Story 3.1 ready for SM create-story authoring. Retro: epic-2-retro-2026-04-18.md; prep: 3-1-brain-session-and-seed-persistence.md; pre-flags: epic-3-story-preflags.md.)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-14
-last_updated: 2026-04-17
+last_updated: 2026-04-18
 project: AI Assistant
 project_key: NOKEY
 tracking_system: file-system
@@ -65,7 +65,7 @@ development_status:
   2-3-guided-mode-creation-wizard: done
   2-4-briefing-card-state-a-initial-capture-and-setup-completion: done
   2-5-api-key-update-post-setup: done
-  epic-2-retrospective: optional
+  epic-2-retrospective: done
 
   # Epic 3: Core Session Loop (Hero Path)
   epic-3: backlog
