@@ -92,9 +92,16 @@ PORT_CONTRACT: dict[ModuleType, tuple[str, tuple[str, ...]]] = {
     brain_port_module: (
         "BrainPort",
         (
-            "load_last_session",
-            "store_session",
-            "load_briefing_aggregate",
+            # Story 3.1 reshape: granular session/seed/snapshot surface
+            # replaces the Story 1.9 stub's aggregate methods.
+            "create_session",
+            "end_session",
+            "get_last_session",
+            "get_last_seed",
+            "store_snapshot",
+            "get_last_snapshot_for_session",
+            # Epic 5 surface retained on the port; adapter stubs each with
+            # ``NotImplementedError("Epic 5 scope")`` until that epic ships.
             "query_memory",
             "delete_matching",
             "confirm_deletion",
@@ -476,6 +483,42 @@ def test_port_method_ordering_matches_contract(module: ModuleType) -> None:
     )
     assert actual_order == expected_order, (
         f"{expected_name} method ordering drift: expected {expected_order}, found {actual_order}."
+    )
+
+
+# Methods that previous story revisions declared on ``BrainPort`` but that
+# Story 3.1's port reshape explicitly removed. Re-introducing any of them is a
+# contract regression that should fail in CI, not slip past the ordering test
+# via a silent PORT_CONTRACT edit. Locked by Story 3.1 AC #26.
+_BRAIN_PORT_REMOVED_METHODS: frozenset[str] = frozenset(
+    {
+        "load_last_session",
+        "store_session",
+        "load_briefing_aggregate",
+    }
+)
+
+
+def test_brain_port_does_not_redeclare_removed_methods() -> None:
+    """Story 3.1 AC #26 — lock the removal of the three Story 1.9 stub methods.
+
+    The ordering test above catches re-introduction as a side-effect of
+    tuple-equality with ``PORT_CONTRACT[brain_port_module]``, but a future
+    PR could silently edit the contract alongside the port definition. This
+    test makes the removal an explicit, named invariant.
+    """
+    class_def = _port_class_def(brain_port_module, "BrainPort")
+    actual_names = {
+        node.name
+        for node in class_def.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    rediscovered = _BRAIN_PORT_REMOVED_METHODS & actual_names
+    assert not rediscovered, (
+        f"BrainPort re-introduced Story 3.1-removed method(s): {sorted(rediscovered)}. "
+        f"Story 3.1 reshape removes load_last_session / store_session / load_briefing_aggregate; "
+        f"the granular methods (create_session / end_session / get_last_session / "
+        f"get_last_seed / store_snapshot / get_last_snapshot_for_session) replace them."
     )
 
 

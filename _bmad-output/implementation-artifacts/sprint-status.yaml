@@ -1,5 +1,5 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-18 (Epic 2 retro done; all 3 critical-path items cleared same-day — A5 coverage floor wired at --cov-fail-under=88 (baseline 90.1%); Story 3.1 prep file authored with full A6 + A10 sections; Stories 3.2/3.3/3.5 pre-flag file authored with A6 classifications. Story 3.1 ready for SM create-story authoring. Retro: epic-2-retro-2026-04-18.md; prep: 3-1-brain-session-and-seed-persistence.md; pre-flags: epic-3-story-preflags.md.)
+# last_updated: 2026-04-21 (Story 3.1 code-review complete — three-layer adversarial review surfaced 1 decision-needed + 15 patches + 6 deferred + 2 dismissed. Decision resolved: BrainPort.end_session now returns stamped ended_at (str) so persist_first_run reuses it for the audit row and sessions.ended_at == audit_log.timestamp byte-exactly. All 16 patches batch-applied: zero-row WARNING on end_session, non-dict JSON guard in get_last_snapshot_for_session, 3 missing tests added (removed-methods regression, SqliteBrainAdapter-in-create_app AST positive case, mock-patch storage arg), spec contradictions reconciled. Full CI gate: 1341 passed + 1 skipped, 93.4% coverage. Story 3.1 status: review → done.)
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-14
-last_updated: 2026-04-18
+last_updated: 2026-04-21 (Story 3.1 complete: review → done. All 16 code-review patches applied; 1341 passed + 1 skipped, 93.4% coverage.)
 project: AI Assistant
 project_key: NOKEY
 tracking_system: file-system
@@ -68,8 +68,8 @@ development_status:
   epic-2-retrospective: done
 
   # Epic 3: Core Session Loop (Hero Path)
-  epic-3: backlog
-  3-1-brain-session-and-seed-persistence: backlog
+  epic-3: in-progress
+  3-1-brain-session-and-seed-persistence: done
   3-2-briefingaggregate-and-state-determination: backlog
   3-3-briefingviewmodel-and-briefing-card-rendering: backlog
   3-4-t1-command-grammar-and-deterministic-parser: backlog

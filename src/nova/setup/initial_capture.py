@@ -20,12 +20,22 @@ Why this module exists (and not ``nova.adapters.win32.context``)
 
 Story 4.1 ships the real :class:`Win32EyesAdapter` behind
 :class:`nova.ports.eyes.EyesPort` with context polling, exclusion
-filtering, and change-deduplication.  Story 2.4 needs a one-shot capture
-at setup time — before the composition root wires any adapter — and
-before Story 3.1's :class:`SqliteBrainAdapter` exists to own session /
-snapshot writes.  This module is the bridge: a setup-only capture and
-persistence path whose lifetime ends when Story 3.1 migrates the direct
-SQL writes to Brain port methods.
+filtering, and change-deduplication.  Story 2.4 needed a one-shot
+capture at setup time — before the composition root wires any
+adapter — and before Story 3.1's :class:`SqliteBrainAdapter` existed
+to own session / snapshot writes.  This module remains the bridge for
+Win32 capture.
+
+Story 3.1 migrated the session + snapshot writes from direct
+``storage.execute(...)`` calls to :class:`BrainPort` methods
+(``create_session`` with ``started_at=capture.snapshot.captured_at`` to
+preserve the Story 2.4 row shape; ``store_snapshot`` with a typed
+:class:`WorkspaceSnapshotInput`; ``end_session`` stamps ``ended_at``
+post-snapshot per AC #12).  The ``setup_complete`` audit row stays as
+a direct INSERT via ``storage.execute(_INSERT_AUDIT_SQL, ...)`` so the
+three-row atomicity invariant is preserved — ``AuditLogger``'s
+observational-swallow contract would break it (see the comment on
+:data:`_INSERT_AUDIT_SQL`).
 
 Dependency surface
 ------------------
@@ -52,6 +62,8 @@ from nova.core import events
 from nova.core.audit import RESULT_SUCCESS, AuditLogger
 from nova.core.storage.engine import SqliteStorageEngine
 from nova.core.types import ActionType, SnapshotType
+from nova.ports.brain import BrainPort
+from nova.systems.brain.models import WorkspaceSnapshotInput
 from nova.systems.eyes.models import WindowContext, WorkspaceSnapshot
 
 logger = logging.getLogger("nova.setup.initial_capture")
@@ -436,23 +448,9 @@ def _derive_status(
 
 
 # ---------------------------------------------------------------------------
-# persist_first_run — AC #10–#17
+# persist_first_run — AC #10–#17 (Story 3.1 migrated session/snapshot to Brain)
 # ---------------------------------------------------------------------------
 
-# Raw SQL used by the setup-time persistence seam.  These two INSERTs
-# are the ONLY direct writes to the sessions / workspace_snapshots
-# tables in the entire codebase until Story 3.1 ships the Brain adapter,
-# at which point ``persist_first_run`` migrates to
-# :class:`nova.ports.brain.BrainPort` and these constants disappear.
-_INSERT_SESSION_SQL = (
-    "INSERT INTO sessions (started_at, ended_at, mode_name, seed_text, summary, is_complete) "
-    "VALUES (?, ?, ?, ?, ?, ?)"
-)
-_UPDATE_SESSION_ENDED_AT_SQL = "UPDATE sessions SET ended_at = ? WHERE id = ?"
-_INSERT_SNAPSHOT_SQL = (
-    "INSERT INTO workspace_snapshots (session_id, captured_at, snapshot_type, workspace_data) "
-    "VALUES (?, ?, ?, ?)"
-)
 # Story 2.4 writes the setup_complete audit row directly inside the
 # session+snapshot transaction rather than through ``AuditLogger.log_action``
 # because the fast-path probe (``nova.setup.__main__._probe_setup_complete``)
@@ -464,37 +462,14 @@ _INSERT_SNAPSHOT_SQL = (
 # ``audit_log`` lands iff the session and snapshot land, and the fast path
 # and the DB state never disagree. ``AuditLogger``'s observational contract
 # stays intact for every OTHER caller.
+#
+# Story 3.1 migrated the session + snapshot writes to ``BrainPort``. The
+# audit row stays as direct SQL — routing it through ``AuditLogger.log_action``
+# would re-introduce the swallow-breaks-atomicity bug this seam deliberately
+# avoids.
 _INSERT_AUDIT_SQL = (
     "INSERT INTO audit_log (timestamp, action_type, target, result, details) VALUES (?, ?, ?, ?, ?)"
 )
-
-
-def _serialize_workspace_data(snapshot: WorkspaceSnapshot, focused_app: str | None) -> str:
-    """Produce the strict-JSON ``workspace_data`` payload.
-
-    Shape per AC #13 and Dev Notes § "Snapshot JSON contract — precise
-    shape":
-
-    * ``apps`` = ascending-sorted list of non-``None`` ``app_name``
-      values (drops windows whose probe lost the app name)
-    * ``focused_app`` = the process name of the foreground window at
-      capture time, or ``None`` if no foreground window was identifiable.
-      The caller resolves this in ``capture_initial_workspace`` by
-      matching ``GetForegroundWindow`` against the enumerated HWND set.
-    * ``mode_name`` = ``null`` — no mode active during setup
-    """
-    apps = sorted(w.app_name for w in snapshot.windows if w.app_name is not None)
-    payload: dict[str, object] = {
-        "apps": apps,
-        "focused_app": focused_app,
-        "mode_name": None,
-    }
-    return json.dumps(
-        payload,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
 
 
 def _serialize_audit_details(
@@ -528,6 +503,9 @@ class _NovaAppLike(Protocol):
     def storage(self) -> SqliteStorageEngine: ...
 
     @property
+    def brain(self) -> BrainPort: ...
+
+    @property
     def audit(self) -> AuditLogger: ...
 
 
@@ -538,52 +516,62 @@ async def persist_first_run(
     api_key_configured: bool,
     modes_count: int,
 ) -> None:
-    """Story 2.4 AC #10–#17 — write the first session + snapshot + audit atomically.
+    """Story 2.4 AC #10–#17 — write session + snapshot + audit atomically.
+
+    Story 3.1 migration: session + snapshot writes now route through
+    :class:`BrainPort`; the ``setup_complete`` audit row keeps its
+    direct-SQL inline INSERT so the three-row atomicity invariant is
+    preserved (see :data:`_INSERT_AUDIT_SQL`'s comment).
 
     Sequence (all inside one ``storage.transaction()``):
 
-    1. INSERT one ``sessions`` row with ``ended_at = NULL`` initially so
-       the timestamp reflects *when persistence completed*, not when the
-       session row was inserted.
-    2. INSERT one ``workspace_snapshots`` row bound to the session via
-       ``lastrowid`` from step 1.
-    3. Capture ``ended_at = _utc_now_iso()`` — AC #12: the session's
-       ``ended_at`` is stamped *after the snapshot is written*.
-    4. UPDATE the session row with the post-snapshot ``ended_at``.
-    5. INSERT the ``setup_complete`` ``audit_log`` row inline (see the
-       comment on :data:`_INSERT_AUDIT_SQL` for why this bypasses
-       :class:`AuditLogger`).
+    1. ``brain.create_session(mode_name=None, started_at=capture.snapshot.captured_at)``
+       — caller-override of ``started_at`` preserves Story 2.4's exact
+       row shape (session's ``started_at`` equals the capture timestamp,
+       not a fresh clock stamp).
+    2. ``brain.store_snapshot(session_id, WorkspaceSnapshotInput(...))``
+       — captured_at is preserved from ``capture.snapshot.captured_at``.
+    3. ``brain.end_session(session_id, ...)`` stamps ``ended_at`` at
+       call time, which is AFTER the snapshot insert — satisfies AC #12.
+    4. Direct INSERT of the ``setup_complete`` audit row (not through
+       :class:`AuditLogger` per the atomicity comment on
+       :data:`_INSERT_AUDIT_SQL`).
 
-    Any failure inside the transaction rolls back all four rows — the
-    fast-path probe and the DB state never disagree. A rolled-back
-    ``sessions.id`` autoincrement slot is released by SQLite on commit
-    failure, so a successful next run starts clean.
+    Any failure inside the transaction rolls back all three rows. A
+    rolled-back ``sessions.id`` autoincrement slot is released by SQLite
+    on commit failure, so a successful next run starts clean.
     """
-    started_at = capture.snapshot.captured_at
-
     storage = app.storage
     async with storage.transaction():
-        session_id = await storage.execute_returning_lastrowid(
-            _INSERT_SESSION_SQL,
-            (started_at, None, None, None, None, 1),
+        session_id = await app.brain.create_session(
+            mode_name=None,
+            started_at=capture.snapshot.captured_at,
         )
-        workspace_data = _serialize_workspace_data(capture.snapshot, capture.focused_app)
-        await storage.execute(
-            _INSERT_SNAPSHOT_SQL,
-            (
-                session_id,
-                capture.snapshot.captured_at,
-                str(SnapshotType.STARTUP),
-                workspace_data,
+        await app.brain.store_snapshot(
+            session_id,
+            WorkspaceSnapshotInput(
+                captured_at=capture.snapshot.captured_at,
+                snapshot_type=SnapshotType.STARTUP,
+                apps=tuple(
+                    sorted(w.app_name for w in capture.snapshot.windows if w.app_name is not None)
+                ),
+                focused_app=capture.focused_app,
+                mode_name=None,
             ),
         )
-        # AC #12 — stamp ``ended_at`` AFTER the snapshot insert lands in
-        # the transaction. Previously this was captured before any write,
-        # making ``ended_at ≈ started_at`` by a microsecond.
-        ended_at = events._utc_now_iso()
-        await storage.execute(
-            _UPDATE_SESSION_ENDED_AT_SQL,
-            (ended_at, session_id),
+        # AC #12 — ``end_session`` stamps ``ended_at`` at call time,
+        # after the snapshot insert. Brain uses ``events._utc_now_iso()``
+        # via module-attribute form so the monkeypatch contract holds.
+        # Story 3.1 code-review patch P0: ``end_session`` now returns the
+        # stamped ``ended_at`` so this seam can reuse it for the audit
+        # row without a second clock sample. Keeps ``sessions.ended_at``
+        # and ``audit_log.timestamp`` byte-equal under the one-
+        # transaction three-row atomicity invariant.
+        audit_timestamp = await app.brain.end_session(
+            session_id,
+            seed_text=None,
+            summary=None,
+            is_complete=True,
         )
         audit_details = _serialize_audit_details(
             modes_count=modes_count,
@@ -593,7 +581,7 @@ async def persist_first_run(
         await storage.execute(
             _INSERT_AUDIT_SQL,
             (
-                ended_at,
+                audit_timestamp,
                 str(ActionType.SETUP_COMPLETE),
                 None,
                 RESULT_SUCCESS,

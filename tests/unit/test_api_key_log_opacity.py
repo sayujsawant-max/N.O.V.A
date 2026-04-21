@@ -148,9 +148,7 @@ class _LeakyCallVisitor(ast.NodeVisitor):
                 if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mod):
                     rhs_label = _match_key_node(sub.right)
                     if rhs_label is not None:
-                        self.findings.append(
-                            (node.lineno, f"%-formatting with {rhs_label!r}")
-                        )
+                        self.findings.append((node.lineno, f"%-formatting with {rhs_label!r}"))
         self.generic_visit(node)
 
 
@@ -306,9 +304,7 @@ def _run_all_visitors(source: str) -> list[str]:
         "bare_name_still_caught",
     ],
 )
-def test_guard_catches_attribute_access_patterns(
-    snippet: str, expected_substring: str
-) -> None:
+def test_guard_catches_attribute_access_patterns(snippet: str, expected_substring: str) -> None:
     """Each synthetic leak must produce at least one finding containing
     the expected substring. Regression guard against weakening the
     ``_match_key_node`` matcher back to a Name-only check.
@@ -345,6 +341,4 @@ def test_guard_does_not_fire_on_unrelated_patterns(snippet: str) -> None:
     over-firing on benign code.
     """
     findings = _run_all_visitors(snippet)
-    assert findings == [], (
-        f"guard fired on legitimate code: {snippet!r}\nfindings: {findings}"
-    )
+    assert findings == [], f"guard fired on legitimate code: {snippet!r}\nfindings: {findings}"

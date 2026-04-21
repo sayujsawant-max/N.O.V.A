@@ -44,6 +44,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from nova.adapters.shield import NoOpShieldAdapter
+from nova.adapters.sqlite.brain import SqliteBrainAdapter
 from nova.core import (
     AuditLogger,
     CapabilityTier,
@@ -53,6 +54,7 @@ from nova.core import (
     TierManager,
 )
 from nova.ports import ShieldPort
+from nova.ports.brain import BrainPort
 
 logger = logging.getLogger("nova.app")
 
@@ -89,6 +91,7 @@ class NovaApp:
 
     config: NovaConfig
     storage: SqliteStorageEngine
+    brain: BrainPort
     event_bus: EventBus
     audit: AuditLogger
     tier_manager: TierManager
@@ -147,6 +150,13 @@ async def create_app(
             extra={"applied_count": len(applied_versions), "versions": applied_versions},
         )
 
+        # Story 3.1 — Brain adapter constructed after migrations are applied so
+        # the ``sessions`` / ``workspace_snapshots`` tables exist. Constructor
+        # is side-effect free (captures the engine reference only), so this
+        # adds zero new failure modes to the partial-init cleanup path.
+        brain: BrainPort = SqliteBrainAdapter(storage)
+        logger.info("brain adapter wired", extra={"adapter": type(brain).__name__})
+
         event_bus = EventBus()
         logger.info("event bus constructed")
 
@@ -158,9 +168,7 @@ async def create_app(
         # normalized to ``None`` by ``_normalize_api_key``) → OFFLINE.
         # Present key → FULL (optimistic; the first real cloud call is what
         # would proof-test validity — Story 3.5 owns that degradation).
-        initial_tier = (
-            CapabilityTier.OFFLINE if config.api_key is None else CapabilityTier.FULL
-        )
+        initial_tier = CapabilityTier.OFFLINE if config.api_key is None else CapabilityTier.FULL
         if initial_tier is CapabilityTier.OFFLINE:
             # Opacity: ``reason`` is a closed-set string; the key value is
             # never logged — only its absence as a category label.
@@ -189,6 +197,7 @@ async def create_app(
         return NovaApp(
             config=config,
             storage=storage,
+            brain=brain,
             event_bus=event_bus,
             audit=audit,
             tier_manager=tier_manager,

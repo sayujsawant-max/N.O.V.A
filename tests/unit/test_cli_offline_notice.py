@@ -208,9 +208,7 @@ def _fake_app_with_api_key(api_key: str | None, tmp_path: Path) -> MagicMock:
     app = MagicMock(spec=NovaApp)
     app.config = _fake_config_with_api_key(api_key, tmp_path)
     app.tier_manager = MagicMock()
-    app.tier_manager.tier = (
-        CapabilityTier.OFFLINE if api_key is None else CapabilityTier.FULL
-    )
+    app.tier_manager.tier = CapabilityTier.OFFLINE if api_key is None else CapabilityTier.FULL
     app.close = AsyncMock()
     return app
 

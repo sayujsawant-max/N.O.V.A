@@ -1,75 +1,66 @@
 """Brain-layer domain models consumed through :mod:`nova.ports.brain`.
 
 These frozen dataclasses are the portable cross-system vocabulary for the
-Brain system: session records, memory items, briefing aggregates, deletion
-previews, and the transparency-model projection. Per Story 1.9 AC #5, every
-sequence-valued field is a ``tuple[T, ...]`` (not ``list[T]``) so frozen-
-dataclass guarantees extend to the containers themselves, not just the outer
-attribute binding. Story 1.3 established the tuple-over-list precedent for
-frozen-dataclass sequence fields (see ``ModeRestored.apps_launched`` in
+Brain system: session summaries, memory items, briefing aggregates,
+workspace-snapshot inputs, deletion previews, and the transparency-model
+projection. Per Story 1.9 AC #5, every sequence-valued field is a
+``tuple[T, ...]`` (not ``list[T]``) so frozen-dataclass guarantees extend
+to the containers themselves, not just the outer attribute binding.
+Story 1.3 established the tuple-over-list precedent for frozen-dataclass
+sequence fields (see ``ModeRestored.apps_launched`` in
 ``nova.core.events``).
 
 Only ``.models`` crosses system boundaries (Story 1.9 AC #8). Ports may
-import any type declared here; system-internal Brain logic lives in a future
-``systems/brain/system.py`` (Story 3.1 scope) that does NOT cross into other
-systems' ports.
+import any type declared here; system-internal Brain logic lives in the
+``SqliteBrainAdapter`` (Story 3.1, :mod:`nova.adapters.sqlite.brain`).
 
 Note on ``ModeInfo`` vs ``ModeConfig``: ``ModeInfo`` (declared here) is the
-Brain-layer projection returned through ``BrainPort.load_briefing_aggregate``
-— mode name plus usage metadata (``last_used_at``). ``ModeConfig`` (in
-:mod:`nova.core.config`) is the full file-backed schema with apps, folders,
-and URLs. They are distinct types with non-overlapping field sets; Story 1.9
-AC #5 locks this distinction via
-``test_mode_info_is_distinct_from_mode_config``.
+Brain-layer projection used in briefing assembly — mode name plus usage
+metadata (``last_used_at``). ``ModeConfig`` (in :mod:`nova.core.config`)
+is the full file-backed schema with apps, folders, and URLs. They are
+distinct types with non-overlapping field sets; Story 1.9 AC #5 locks
+this distinction via ``test_mode_info_is_distinct_from_mode_config``.
+
+Story 3.1 reshape
+-----------------
+- ``SessionSummary`` gains ``summary: str | None`` (the session-summary
+  text field persisted in ``sessions.summary``). The adapter reads it
+  back in ``get_last_session``.
+- ``WorkspaceSnapshotInput`` (NEW) — typed inbound DTO for
+  ``BrainPort.store_snapshot``. Carries the flat shape that matches
+  Story 2.4's locked ``workspace_snapshots.workspace_data`` JSON (three
+  fields: ``apps``, ``focused_app``, ``mode_name``) plus ``captured_at``
+  and ``snapshot_type`` for the row columns. The adapter serializes the
+  last four fields into the JSON; ``captured_at`` goes straight to its
+  column. No raw ``dict`` crosses the port boundary.
+- ``Session`` and ``SessionData`` (Story 1.9 stub shapes for
+  ``load_last_session`` / ``store_session``) are removed — both methods
+  are dropped from ``BrainPort`` in Story 3.1 and no adapter ever
+  implemented them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nova.core.types import MemoryCategory
+from nova.core.types import MemoryCategory, SnapshotType
 from nova.systems.eyes.models import WorkspaceSnapshot
-
-
-@dataclass(frozen=True)
-class Session:
-    """Row-shaped session record returned by ``BrainPort.load_last_session``.
-
-    ``ended_at`` is ``None`` for in-flight sessions (the current one, or a
-    crash-recovered incomplete session). ``is_complete`` is ``False`` for
-    crash-recovery paths (Story 3.10) even if the row carries an
-    ``ended_at`` timestamp.
-    """
-
-    id: int
-    started_at: str
-    ended_at: str | None
-    mode_name: str | None
-    is_complete: bool
-
-
-@dataclass(frozen=True)
-class SessionData:
-    """Durable session payload passed to ``BrainPort.store_session``.
-
-    ``seed_text`` is ``None`` when the user skipped the shutdown seed
-    prompt. ``mode_name`` is ``None`` when the session exited without ever
-    selecting a mode (e.g., cancelled first-run setup).
-    """
-
-    seed_text: str | None
-    mode_name: str | None
-    duration_seconds: int
-    ended_at: str
 
 
 @dataclass(frozen=True)
 class SessionSummary:
     """Summary projection of a session, surfaced to briefings and shutdown.
 
-    Distinct from :class:`Session` in that this is the BriefingAggregate-facing
-    shape — includes ``duration_seconds`` precomputed — whereas :class:`Session`
-    is the adapter-facing row shape.
+    Returned by ``BrainPort.get_last_session`` (Story 3.1). The adapter
+    computes ``duration_seconds`` from ``started_at`` and ``ended_at``
+    (or ``0`` when ``ended_at is None`` — the interrupted-session
+    convention). ``is_complete`` is coerced from SQLite's INTEGER
+    ``0`` / ``1`` to Python ``bool`` at the adapter boundary.
+
+    ``summary`` (Story 3.1 addition) is the ``sessions.summary`` column
+    — free-form text written by Story 3.7's shutdown flow, ``None`` for
+    the setup-session row (Story 2.4 writes ``NULL``) and for any
+    session that exited without a summary.
     """
 
     session_id: int
@@ -77,12 +68,46 @@ class SessionSummary:
     ended_at: str | None
     duration_seconds: int
     mode_name: str | None
+    summary: str | None
     is_complete: bool
 
 
 @dataclass(frozen=True)
+class WorkspaceSnapshotInput:
+    """Typed inbound DTO for ``BrainPort.store_snapshot`` (Story 3.1).
+
+    The adapter writes ``captured_at`` directly into
+    ``workspace_snapshots.captured_at``, ``snapshot_type`` (via
+    ``str(...)``) into the matching column, and serializes
+    ``{apps, focused_app, mode_name}`` into the ``workspace_data`` JSON
+    column using the Story 2.4-locked compact shape:
+    ``{"apps":[...],"focused_app":...,"mode_name":...}`` with
+    ``separators=(",",":"), ensure_ascii=False, allow_nan=False``.
+
+    ``apps`` is ``tuple[str, ...]`` (not ``list[str]``) per Story 1.9
+    AC #5 / cross-cutting-patterns.md #3 — sequence fields on frozen
+    dataclasses must be tuples for genuine immutability.
+
+    No raw ``dict`` crosses the port boundary — callers construct this
+    typed input; the adapter owns JSON ser/deser internally.
+    """
+
+    captured_at: str
+    snapshot_type: SnapshotType
+    apps: tuple[str, ...]
+    focused_app: str | None
+    mode_name: str | None
+
+
+@dataclass(frozen=True)
 class MemoryItem:
-    """Row-shaped memory record returned by ``BrainPort.query_memory``."""
+    """Row-shaped memory record returned by ``BrainPort.query_memory``.
+
+    Epic 5 scope — Story 3.1's adapter stubs ``query_memory`` with
+    ``NotImplementedError("Epic 5 scope")`` but the domain model ships
+    today so downstream briefing/memory consumers (Stories 3.7 seed
+    capture, Epic 4 memory accumulation) have the type to reference.
+    """
 
     id: int
     category: MemoryCategory
@@ -144,10 +169,14 @@ class TransparencyModel:
 
 @dataclass(frozen=True)
 class BriefingAggregate:
-    """One-shot read aggregate returned by ``BrainPort.load_briefing_aggregate``.
+    """Read aggregate used by Nerve to drive briefing assembly (Story 3.2+).
 
-    Consumed by Ritual to build the BriefingViewModel (architecture.md T1
-    Continuity Loop). All sequence fields are ``tuple[T, ...]`` for true
+    Historically returned by ``BrainPort.load_briefing_aggregate`` (Story
+    1.9 stub). Story 3.1 removes that port method because epic 3.2 places
+    briefing assembly in Nerve, not Brain (Brain provides granular
+    persisted-fact queries only). The ``BriefingAggregate`` type itself
+    survives — it is the Nerve-assembled shape consumed by Ritual /
+    Voice / Skin. All sequence fields are ``tuple[T, ...]`` for true
     immutability under ``frozen=True``.
 
     Cross-system model reference: ``last_snapshot`` is
@@ -170,8 +199,7 @@ __all__: list[str] = [
     "DeletionResult",
     "MemoryItem",
     "ModeInfo",
-    "Session",
-    "SessionData",
     "SessionSummary",
     "TransparencyModel",
+    "WorkspaceSnapshotInput",
 ]

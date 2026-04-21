@@ -29,9 +29,7 @@ def _repo_root() -> Path:
     for candidate in (here, *here.parents):
         if (candidate / "pyproject.toml").is_file():
             return candidate
-    raise RuntimeError(
-        f"could not locate repo-root sentinel (pyproject.toml) from {here}"
-    )
+    raise RuntimeError(f"could not locate repo-root sentinel (pyproject.toml) from {here}")
 
 
 def _readme_path() -> Path:
@@ -75,8 +73,7 @@ def test_readme_has_api_key_management_section(readme_text: str) -> None:
     # Unique markers — true section structure, must not be duplicated.
     for unique_marker in ("## API key management", "does NOT crash bootstrap"):
         assert readme_text.count(unique_marker) == 1, (
-            f"{unique_marker!r} must appear exactly once "
-            f"(found {readme_text.count(unique_marker)})"
+            f"{unique_marker!r} must appear exactly once (found {readme_text.count(unique_marker)})"
         )
 
 
@@ -106,8 +103,8 @@ def test_readme_does_not_leak_resolved_user_path(readme_text: str) -> None:
     forbidden_substrings = (
         "c:\\users\\",
         "c:/users/",
-        "/users/",   # macOS home-dir root
-        "/home/",    # Linux home-dir root
+        "/users/",  # macOS home-dir root
+        "/home/",  # Linux home-dir root
     )
     for fragment in forbidden_substrings:
         assert fragment not in lowered, (

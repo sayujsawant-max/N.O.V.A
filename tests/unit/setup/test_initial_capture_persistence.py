@@ -13,10 +13,12 @@ from pathlib import Path
 
 import pytest
 
+from nova.adapters.sqlite.brain import SqliteBrainAdapter
 from nova.core.audit import AuditLogger
 from nova.core.exceptions import StorageError
 from nova.core.storage.engine import SqliteStorageEngine
 from nova.core.types import ActionType, SnapshotType
+from nova.ports.brain import BrainPort
 from nova.setup.initial_capture import (
     CaptureResult,
     persist_first_run,
@@ -25,10 +27,15 @@ from nova.systems.eyes.models import WindowContext, WorkspaceSnapshot
 
 
 class _HarnessApp:
-    """Minimal ``NovaApp``-like object satisfying the protocol."""
+    """Minimal ``NovaApp``-like object satisfying the protocol.
+
+    Story 3.1 added the ``brain`` attribute — ``persist_first_run``
+    routes session and snapshot writes through :class:`BrainPort`.
+    """
 
     def __init__(self, storage: SqliteStorageEngine) -> None:
         self.storage = storage
+        self.brain: BrainPort = SqliteBrainAdapter(storage)
         self.audit = AuditLogger(storage=storage)
 
 

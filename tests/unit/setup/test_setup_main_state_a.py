@@ -243,18 +243,22 @@ async def test_no_fast_path_when_db_exists_but_no_setup_complete_row(
     # After a successful persist run, exactly one row lands in each table.
     # We simulate that here with persist_first_run directly, skipping the
     # wizard (covered by the integration suite).
+    from nova.adapters.sqlite.brain import SqliteBrainAdapter
     from nova.core.audit import AuditLogger
     from nova.core.types import SnapshotType
+    from nova.ports.brain import BrainPort
     from nova.setup.initial_capture import CaptureResult, persist_first_run
     from nova.systems.eyes.models import WorkspaceSnapshot
 
     engine = SqliteStorageEngine(data_dir / "nova.db")
     await engine.start()
     try:
+        await engine.run_migrations()
 
         class _App:
             def __init__(self, storage: SqliteStorageEngine) -> None:
                 self.storage = storage
+                self.brain: BrainPort = SqliteBrainAdapter(storage)
                 self.audit = AuditLogger(storage=storage)
 
         capture = CaptureResult(

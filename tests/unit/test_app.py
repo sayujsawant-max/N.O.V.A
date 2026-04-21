@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from nova.adapters.shield import NoOpShieldAdapter
+from nova.adapters.sqlite.brain import SqliteBrainAdapter
 from nova.app import NovaApp, _AlwaysHealthyCheck, create_app
 from nova.core import (
     AuditLogger,
@@ -22,6 +23,7 @@ from nova.core import (
 )
 from nova.core.exceptions import StorageError
 from nova.core.types import ActionType
+from nova.ports.brain import BrainPort
 
 
 def _build_config(tmp_path: Path, *, api_key: str | None = "sk-ant-test") -> NovaConfig:
@@ -53,6 +55,7 @@ async def test_create_app_returns_populated_novaapp(tmp_path: Path) -> None:
         assert isinstance(app, NovaApp)
         assert app.config is config
         assert isinstance(app.storage, SqliteStorageEngine)
+        assert isinstance(app.brain, SqliteBrainAdapter)
         assert isinstance(app.event_bus, EventBus)
         assert isinstance(app.audit, AuditLogger)
         assert isinstance(app.tier_manager, TierManager)
@@ -74,6 +77,73 @@ async def test_novaapp_is_frozen(tmp_path: Path) -> None:
     try:
         with pytest.raises(FrozenInstanceError):
             setattr(app, "config", config)  # noqa: B010
+    finally:
+        await app.close()
+
+
+async def test_novaapp_brain_structurally_satisfies_brainport(tmp_path: Path) -> None:
+    """Story 3.1 — ``NovaApp.brain`` is a concrete :class:`BrainPort` instance.
+
+    mypy strict also enforces the type at call sites; this runtime check
+    catches accidental method removal from the adapter or the Protocol.
+    """
+    config = _build_config(tmp_path)
+    app = await create_app(config)
+    try:
+        brain: BrainPort = app.brain
+        for name in (
+            "create_session",
+            "end_session",
+            "get_last_session",
+            "get_last_seed",
+            "store_snapshot",
+            "get_last_snapshot_for_session",
+            "query_memory",
+            "delete_matching",
+            "confirm_deletion",
+            "get_transparency_model",
+        ):
+            assert callable(getattr(brain, name))
+    finally:
+        await app.close()
+
+
+async def test_create_app_instantiates_sqlite_brain_adapter_with_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 3.1 AC #23 / Task 6 — patch :class:`SqliteBrainAdapter` in
+    :mod:`nova.app` and assert ``create_app`` calls it with the started
+    storage engine.
+
+    A silent regression that wires Brain with the wrong argument (for
+    example passing ``audit`` instead of ``storage`` — both are
+    legitimate attributes on ``NovaApp`` and both make the adapter
+    constructor succeed since it only captures the reference) would
+    pass the ``isinstance(app.brain, SqliteBrainAdapter)`` check but
+    fail this one.
+    """
+    captured_args: list[object] = []
+
+    class _RecordingAdapter(SqliteBrainAdapter):
+        def __init__(self, storage: SqliteStorageEngine) -> None:
+            captured_args.append(storage)
+            super().__init__(storage)
+
+    # ``create_app`` calls ``SqliteBrainAdapter(storage)`` by name, so
+    # patching the attribute on the ``nova.app`` module redirects the
+    # live wiring call to the recording subclass.
+    monkeypatch.setattr("nova.app.SqliteBrainAdapter", _RecordingAdapter)
+
+    config = _build_config(tmp_path)
+    app = await create_app(config)
+    try:
+        assert len(captured_args) == 1, (
+            f"SqliteBrainAdapter must be instantiated exactly once; got {len(captured_args)}"
+        )
+        assert captured_args[0] is app.storage, (
+            "SqliteBrainAdapter must be constructed with app.storage (the started engine), "
+            f"got a {type(captured_args[0]).__name__} instance that does not match."
+        )
     finally:
         await app.close()
 
@@ -361,8 +431,7 @@ async def test_initial_tier_is_offline_when_api_key_is_none(
         offline_records = [
             rec
             for rec in caplog.records
-            if rec.name == "nova.app"
-            and "starting in offline-local-only tier" in rec.message
+            if rec.name == "nova.app" and "starting in offline-local-only tier" in rec.message
         ]
         assert len(offline_records) == 1
         # ``reason`` is injected via ``extra={"reason": "no_api_key"}`` — it
@@ -384,8 +453,7 @@ async def test_initial_tier_is_full_when_api_key_is_present(
         assert app.tier_manager.tier is CapabilityTier.FULL
         # AC #6 — no new "starting in offline" log when the key is present.
         assert not any(
-            "starting in offline-local-only tier" in rec.message
-            for rec in caplog.records
+            "starting in offline-local-only tier" in rec.message for rec in caplog.records
         )
     finally:
         await app.close()

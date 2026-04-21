@@ -606,9 +606,7 @@ def test_api_key_whitespace_normalizes_to_none(tmp_path: Path) -> None:
         "list_is_none",
     ],
 )
-def test_normalize_api_key_variants(
-    tmp_path: Path, yaml_body: str, expected: str | None
-) -> None:
+def test_normalize_api_key_variants(tmp_path: Path, yaml_body: str, expected: str | None) -> None:
     """Story 2.5 AC #3 — lock the ``_normalize_api_key`` contract."""
     data_dir = _bootstrap_data_dir(tmp_path)
     _write(data_dir / "settings.yaml", yaml_body)

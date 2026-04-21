@@ -61,9 +61,9 @@ def test_exactly_one_argument_parser_construction() -> None:
             continue
         callee = node.func
         # Match ``argparse.ArgumentParser(...)`` or bare ``ArgumentParser(...)``.
-        if (
-            isinstance(callee, ast.Attribute) and callee.attr == "ArgumentParser"
-        ) or (isinstance(callee, ast.Name) and callee.id == "ArgumentParser"):
+        if (isinstance(callee, ast.Attribute) and callee.attr == "ArgumentParser") or (
+            isinstance(callee, ast.Name) and callee.id == "ArgumentParser"
+        ):
             parser_constructions.append(node.lineno)
     assert len(parser_constructions) == 1, (
         f"cli.py must construct exactly one ArgumentParser. "

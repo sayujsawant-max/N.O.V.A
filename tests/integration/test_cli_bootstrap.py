@@ -49,9 +49,7 @@ def nova_data_dir(tmp_path: Path) -> Path:
     empty stderr; without a key we'd now trip the notice. Tests that
     want to exercise the no-key path override this file explicitly.
     """
-    (tmp_path / "settings.yaml").write_text(
-        'api_key: "sk-ant-test-bootstrap"\n', encoding="utf-8"
-    )
+    (tmp_path / "settings.yaml").write_text('api_key: "sk-ant-test-bootstrap"\n', encoding="utf-8")
     (tmp_path / "exclusions.yaml").write_text("{}\n", encoding="utf-8")
     # Seed a single valid mode so the "zero modes" warning stays silent.
     modes_dir = tmp_path / "modes"

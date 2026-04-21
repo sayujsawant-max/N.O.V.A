@@ -29,7 +29,17 @@ SETUP_PACKAGE_DIR = Path(__file__).resolve().parents[3] / "src" / "nova" / "setu
 
 ALLOWED_SYSTEMS_IMPORTS: frozenset[str] = frozenset(
     {
+        # Story 2.4 precedent — WorkspaceSnapshot / WindowContext carriers.
         "nova.systems.eyes.models",
+        # Story 3.1 — setup passes typed ``WorkspaceSnapshotInput`` to Brain.
+        "nova.systems.brain.models",
+    }
+)
+
+ALLOWED_PORTS_IMPORTS: frozenset[str] = frozenset(
+    {
+        # Story 3.1 — setup routes session/snapshot writes through BrainPort.
+        "nova.ports.brain",
     }
 )
 
@@ -62,6 +72,7 @@ def _has_forbidden_prefix(name: str, prefixes: tuple[str, ...]) -> bool:
 @pytest.mark.parametrize("py_file", _iter_setup_py_files(), ids=lambda p: p.name)
 def test_setup_module_has_no_forbidden_imports(py_file: Path) -> None:
     tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    allowlist: frozenset[str] = ALLOWED_SYSTEMS_IMPORTS | ALLOWED_PORTS_IMPORTS
     leaked: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module is not None:
@@ -75,21 +86,22 @@ def test_setup_module_has_no_forbidden_imports(py_file: Path) -> None:
                 continue
             if (
                 _has_forbidden_prefix(node.module, FORBIDDEN_IMPORT_PREFIXES)
-                and node.module not in ALLOWED_SYSTEMS_IMPORTS
+                and node.module not in allowlist
             ):
                 leaked.append(node.module)
             for alias in node.names:
                 composed = f"{node.module}.{alias.name}"
                 if (
                     _has_forbidden_prefix(composed, FORBIDDEN_IMPORT_PREFIXES)
-                    and composed not in ALLOWED_SYSTEMS_IMPORTS
+                    and composed not in allowlist
+                    and node.module not in allowlist
                 ):
                     leaked.append(composed)
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if (
                     _has_forbidden_prefix(alias.name, FORBIDDEN_IMPORT_PREFIXES)
-                    and alias.name not in ALLOWED_SYSTEMS_IMPORTS
+                    and alias.name not in allowlist
                 ):
                     leaked.append(alias.name)
     assert not leaked, f"Forbidden imports in {py_file.name}: {sorted(set(leaked))}"

@@ -430,6 +430,13 @@ class TestInitialCaptureAndCompletion:
     Win32 APIs and run identically on any platform.
     """
 
+    # Shared fixture timestamp — used by ``_mock_capture`` to stamp the
+    # WorkspaceSnapshot and by row-shape assertions that need to confirm
+    # the capture timestamp flowed through Brain's persistence path
+    # unchanged. Keeping the constant on the class surface makes the
+    # linkage explicit (Story 3.1 code-review patch P11).
+    MOCK_CAPTURE_TIMESTAMP = "2026-04-17T12:00:00+00:00"
+
     @staticmethod
     def _seed_data_dir(tmp_path: Path) -> Path:
         """Create an isolated nova data dir with settings.yaml + one mode."""
@@ -449,8 +456,9 @@ class TestInitialCaptureAndCompletion:
         )
         return nova_dir
 
-    @staticmethod
+    @classmethod
     def _mock_capture(
+        cls,
         monkeypatch: pytest.MonkeyPatch,
         *,
         status: str = "full",
@@ -471,7 +479,7 @@ class TestInitialCaptureAndCompletion:
             for i in range(captured)
         )
         snapshot = WorkspaceSnapshot(
-            captured_at="2026-04-17T12:00:00+00:00",
+            captured_at=cls.MOCK_CAPTURE_TIMESTAMP,
             snapshot_type=SnapshotType.STARTUP,
             windows=windows,
         )
@@ -873,4 +881,151 @@ class TestInitialCaptureAndCompletion:
 
         assert len(sessions) == 0, "session row must roll back when audit fails"
         assert len(snapshots) == 0, "snapshot row must roll back when audit fails"
+        assert len(audits) == 0
+
+    # ------------------------------------------------------------------
+    # Story 3.1 — setup-seam migration through BrainPort
+    # ------------------------------------------------------------------
+
+    def test_setup_flow_routes_session_and_snapshot_writes_through_brain(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC #19/#28 — migrated persist_first_run reaches Brain, not raw SQL.
+
+        Mock-patches each of the three Brain session/snapshot methods on
+        the live ``NovaApp.brain`` instance via a targeted wrapper around
+        ``nova.app.create_app``. Asserts the calls land in the expected
+        order and that the session's ``started_at`` is preserved from
+        ``capture.snapshot.captured_at`` (the A10 row-shape invariant).
+        """
+        from nova.setup.__main__ import EXIT_OK, main
+
+        self._seed_data_dir(tmp_path)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        self._disable_interactive_io(monkeypatch)
+        self._mock_capture(monkeypatch, status="full", captured=2)
+
+        captured_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+        from nova.adapters.sqlite.brain import SqliteBrainAdapter
+
+        real_create_session = SqliteBrainAdapter.create_session
+        real_store_snapshot = SqliteBrainAdapter.store_snapshot
+        real_end_session = SqliteBrainAdapter.end_session
+
+        async def recording_create_session(
+            self: SqliteBrainAdapter,
+            mode_name: str | None,
+            *,
+            started_at: str | None,
+        ) -> int:
+            captured_calls.append(("create_session", (mode_name,), {"started_at": started_at}))
+            return await real_create_session(self, mode_name, started_at=started_at)
+
+        async def recording_store_snapshot(
+            self: SqliteBrainAdapter,
+            session_id: int,
+            snapshot: object,
+        ) -> None:
+            captured_calls.append(("store_snapshot", (session_id, snapshot), {}))
+            await real_store_snapshot(self, session_id, snapshot)  # type: ignore[arg-type]
+
+        async def recording_end_session(
+            self: SqliteBrainAdapter,
+            session_id: int,
+            *,
+            seed_text: str | None,
+            summary: str | None,
+            is_complete: bool,
+        ) -> str:
+            captured_calls.append(
+                (
+                    "end_session",
+                    (session_id,),
+                    {
+                        "seed_text": seed_text,
+                        "summary": summary,
+                        "is_complete": is_complete,
+                    },
+                )
+            )
+            return await real_end_session(
+                self,
+                session_id,
+                seed_text=seed_text,
+                summary=summary,
+                is_complete=is_complete,
+            )
+
+        monkeypatch.setattr(SqliteBrainAdapter, "create_session", recording_create_session)
+        monkeypatch.setattr(SqliteBrainAdapter, "store_snapshot", recording_store_snapshot)
+        monkeypatch.setattr(SqliteBrainAdapter, "end_session", recording_end_session)
+
+        assert main([]) == EXIT_OK
+
+        # Call order asserted verbatim — matches AC #18's shape.
+        call_names = [c[0] for c in captured_calls]
+        assert call_names == ["create_session", "store_snapshot", "end_session"]
+
+        # Row-shape invariants:
+        # - create_session receives the capture timestamp as started_at (A10).
+        _, create_args, create_kwargs = captured_calls[0]
+        assert create_args == (None,), "setup session has no mode_name"
+        assert create_kwargs["started_at"] == self.MOCK_CAPTURE_TIMESTAMP
+        # - store_snapshot receives a WorkspaceSnapshotInput with matching captured_at.
+        from nova.systems.brain.models import WorkspaceSnapshotInput
+
+        _, store_args, _ = captured_calls[1]
+        snap_input = store_args[1]
+        assert isinstance(snap_input, WorkspaceSnapshotInput)
+        assert snap_input.captured_at == self.MOCK_CAPTURE_TIMESTAMP
+        # - end_session asserts is_complete=True with no seed/summary.
+        _, _, end_kwargs = captured_calls[2]
+        assert end_kwargs == {
+            "seed_text": None,
+            "summary": None,
+            "is_complete": True,
+        }
+
+    def test_brain_store_snapshot_failure_rolls_back_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Story 3.1 rollback invariant: a StorageError from brain.store_snapshot
+        rolls back the session+snapshot atomic pair (the audit row never
+        gets inserted because the exception escapes the transaction
+        before the audit INSERT is reached).
+        """
+        import sqlite3
+
+        from nova.adapters.sqlite.brain import SqliteBrainAdapter
+        from nova.core.exceptions import StorageError
+        from nova.setup.__main__ import EXIT_CONFIG_ERROR, main
+
+        self._seed_data_dir(tmp_path)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        self._disable_interactive_io(monkeypatch)
+        self._mock_capture(monkeypatch, status="full", captured=1)
+
+        async def failing_store_snapshot(
+            self: SqliteBrainAdapter, session_id: int, snapshot: object
+        ) -> None:
+            del self, session_id, snapshot
+            raise StorageError("simulated brain store_snapshot failure")
+
+        monkeypatch.setattr(SqliteBrainAdapter, "store_snapshot", failing_store_snapshot)
+
+        assert main([]) == EXIT_CONFIG_ERROR
+
+        # Atomicity check: the session row that was just inserted (before
+        # store_snapshot raised) must have rolled back.
+        with sqlite3.connect(tmp_path / "nova" / "nova.db") as conn:
+            conn.row_factory = sqlite3.Row
+            sessions = conn.execute("SELECT id FROM sessions").fetchall()
+            snapshots = conn.execute("SELECT id FROM workspace_snapshots").fetchall()
+            audits = conn.execute(
+                "SELECT id FROM audit_log WHERE action_type = 'setup_complete'"
+            ).fetchall()
+
+        assert len(sessions) == 0, "session row must roll back when brain.store_snapshot fails"
+        assert len(snapshots) == 0
         assert len(audits) == 0

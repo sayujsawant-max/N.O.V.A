@@ -1,15 +1,24 @@
-"""AST guards for ``nova.setup.initial_capture`` (Story 2.4 AC #25).
+"""AST guards for ``nova.setup.initial_capture`` (Story 2.4 AC #25, Story 3.1 allowlist).
 
 ``initial_capture.py`` owns the setup-time seam that writes directly to
-``sessions``, ``workspace_snapshots``, and ``audit_log`` before Brain's
-adapter exists (Story 3.1). To keep that seam narrow, the module:
+``audit_log`` (and, prior to Story 3.1, to ``sessions`` and
+``workspace_snapshots`` as well — those now route through
+:class:`nova.ports.brain.BrainPort`). To keep that seam narrow, the
+module:
 
-1. MUST NOT import from ``nova.adapters.*`` or ``nova.ports.*`` —
-   setup-time code bypasses the port/adapter wiring by design.
-2. MUST NOT import from ``nova.systems.eyes.system`` (or any other
+1. MUST NOT import from ``nova.adapters.*`` — setup-time code never
+   references concrete adapter classes; composition root hides them.
+2. MAY import from ``nova.ports.brain`` — Story 3.1 routes session /
+   snapshot writes through :class:`BrainPort`, so the port protocol is
+   a legitimate setup-time dependency. Every other ``nova.ports.*``
+   stays forbidden (ports are an orchestrator-layer concern).
+3. MUST NOT import from ``nova.systems.eyes.system`` (or any other
    system's ``system.py``) — only ``.models`` modules may cross system
    boundaries (Story 1.9 AC #8).
-3. MUST NOT dynamically import those same prefixes via
+4. MAY import from ``nova.systems.brain.models`` for
+   :class:`WorkspaceSnapshotInput` (Story 3.1 — typed input DTO the
+   migrated ``persist_first_run`` passes to ``brain.store_snapshot``).
+5. MUST NOT dynamically import any forbidden prefix via
    ``__import__`` / ``importlib.import_module``.
 
 Mirrors the shape of ``tests/unit/setup/test_mode_wizard_isolation.py``.
@@ -25,6 +34,20 @@ from types import ModuleType
 import pytest
 
 import nova.setup.initial_capture as initial_capture_module
+
+ALLOWED_PORTS_IMPORTS: frozenset[str] = frozenset(
+    {
+        # Story 3.1 — setup routes session/snapshot writes through BrainPort.
+        "nova.ports.brain",
+    }
+)
+
+ALLOWED_BRAIN_MODELS_IMPORTS: frozenset[str] = frozenset(
+    {
+        # Story 3.1 — setup passes a typed ``WorkspaceSnapshotInput`` to Brain.
+        "nova.systems.brain.models",
+    }
+)
 
 FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "nova.adapters",
@@ -54,6 +77,7 @@ def _read_module_source(module: ModuleType) -> str:
 @pytest.mark.parametrize("module", [initial_capture_module])
 def test_initial_capture_does_not_import_forbidden(module: ModuleType) -> None:
     tree = ast.parse(_read_module_source(module))
+    allowlist: frozenset[str] = ALLOWED_PORTS_IMPORTS | ALLOWED_BRAIN_MODELS_IMPORTS
     leaked: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module is not None:
@@ -65,16 +89,25 @@ def test_initial_capture_does_not_import_forbidden(module: ModuleType) -> None:
             if node.level > 0:
                 leaked.append(f"{'.' * node.level}{node.module}  (relative import forbidden)")
                 continue
-            if _has_forbidden_prefix(node.module, FORBIDDEN_PREFIXES):
+            if (
+                _has_forbidden_prefix(node.module, FORBIDDEN_PREFIXES)
+                and node.module not in allowlist
+            ):
                 leaked.append(node.module)
                 continue
             for alias in node.names:
                 composed = f"{node.module}.{alias.name}"
-                if _has_forbidden_prefix(composed, FORBIDDEN_PREFIXES):
+                if (
+                    _has_forbidden_prefix(composed, FORBIDDEN_PREFIXES)
+                    and node.module not in allowlist
+                ):
                     leaked.append(composed)
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if _has_forbidden_prefix(alias.name, FORBIDDEN_PREFIXES):
+                if (
+                    _has_forbidden_prefix(alias.name, FORBIDDEN_PREFIXES)
+                    and alias.name not in allowlist
+                ):
                     leaked.append(alias.name)
     assert not leaked, f"Forbidden imports in {module.__name__}: {sorted(set(leaked))}."
 
@@ -101,10 +134,15 @@ def test_initial_capture_no_dynamic_forbidden_imports(module: ModuleType) -> Non
     assert not leaked, f"Dynamic forbidden imports in {module.__name__}: {sorted(set(leaked))}."
 
 
-def test_initial_capture_only_eyes_models_not_systems() -> None:
-    """Positive-list assertion: the ONLY ``nova.systems.*`` import is
-    ``nova.systems.eyes.models``. Other system models would be a red
-    flag for setup-time scope creep.
+def test_initial_capture_only_allowed_systems_models_imports() -> None:
+    """Positive-list assertion: the ONLY ``nova.systems.*`` imports are the
+    allowlisted ``.models`` modules.
+
+    Story 2.4 permitted ``nova.systems.eyes.models`` for
+    :class:`WorkspaceSnapshot` / :class:`WindowContext`. Story 3.1 adds
+    ``nova.systems.brain.models`` for :class:`WorkspaceSnapshotInput`.
+    Any other ``nova.systems.*`` import is scope creep and fails this
+    test.
     """
     tree = ast.parse(_read_module_source(initial_capture_module))
     systems_imports: list[str] = []
@@ -115,4 +153,5 @@ def test_initial_capture_only_eyes_models_not_systems() -> None:
             and node.module.startswith("nova.systems")
         ):
             systems_imports.append(node.module)
-    assert systems_imports == ["nova.systems.eyes.models"], systems_imports
+    allowed_sorted = sorted({"nova.systems.eyes.models", "nova.systems.brain.models"})
+    assert sorted(set(systems_imports)) == allowed_sorted, systems_imports

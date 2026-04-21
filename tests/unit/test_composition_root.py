@@ -293,6 +293,40 @@ def _is_inside_function_or_class(node: ast.AST) -> bool:
     )
 
 
+def test_sqlite_brain_adapter_is_instantiated_inside_create_app() -> None:
+    """Story 3.1 AC #23 — positive-case AST assertion complementing
+    ``test_app_module_level_has_no_adapter_instantiation``.
+
+    The module-scope test above catches the negative case (no adapter
+    instantiation outside a function). This test pins the positive case:
+    the ``SqliteBrainAdapter(...)`` call must appear SOMEWHERE inside
+    ``create_app``'s body, so a silent deletion of the wiring (adapter
+    never constructed, ``NovaApp.brain`` would be left unassigned or
+    wired to a stub) cannot slip past CI.
+    """
+    app_path = NOVA_SRC_ROOT / "app.py"
+    tree = ast.parse(app_path.read_text(encoding="utf-8"))
+
+    create_app_fn: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "create_app":
+            create_app_fn = node
+            break
+    assert create_app_fn is not None, "create_app function not found in app.py"
+
+    instantiations: list[str] = []
+    for inner in ast.walk(create_app_fn):
+        if not isinstance(inner, ast.Call):
+            continue
+        callee = inner.func
+        if isinstance(callee, ast.Name) and callee.id == "SqliteBrainAdapter":
+            instantiations.append(ast.unparse(inner))
+    assert instantiations, (
+        "create_app must instantiate SqliteBrainAdapter; none found. "
+        "Story 3.1 AC #23 requires the Brain adapter to be wired in the composition root."
+    )
+
+
 # --- AC #8 tests ------------------------------------------------------------
 
 # Allowlist of logger-name-depth exceptions. The storage sublayer (Story
@@ -302,6 +336,11 @@ _LOGGER_NAME_DEPTH_ALLOWLIST: frozenset[str] = frozenset(
     {
         "nova.core.storage.engine",
         "nova.core.storage.migrations.runner",
+        # Story 3.1 — concrete adapter under ``adapters/{driver}/{system}``
+        # mirrors the storage-sublayer nesting precedent. Future
+        # drivers (e.g. a Postgres Brain adapter in T2) follow the same
+        # ``nova.adapters.{driver}.{system}`` logger-name shape.
+        "nova.adapters.sqlite.brain",
     }
 )
 
