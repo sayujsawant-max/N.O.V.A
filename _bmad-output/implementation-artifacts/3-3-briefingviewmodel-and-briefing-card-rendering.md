@@ -16,92 +16,19 @@ So that bare `nova` boot (Story 3.5) can show me a clean State A / B / C Briefin
 
 ## Story-type classification
 
-**Interaction-boundary story** (Epic 2 retro A6). Pre-flagged in [epic-3-story-preflags.md:24-33](epic-3-story-preflags.md#L24-L33). Three questions:
-
-1. **New contract between existing pieces?** YES. This is the **first production use of the Ritual → Skin pipeline**. Every prior epic shipped Skin / Ritual as docstring-only placeholder packages — Story 1.9 declared the ports, Stories 2.4 / 3.1 / 3.2 produced and consumed the upstream domain models (`BriefingAggregate`, `BriefingState`, `ModeInfo`), but no code has populated `BriefingViewModel` or rendered a Briefing Card through `SkinPort`. Story 3.3 introduces the `RitualSystem` class (concrete `RitualPort` adapter), the `RichSkinAdapter` class (concrete `SkinPort` adapter), the **progressive omission** rendering invariant (fields with no data are omitted — no placeholders, no "N/A"), and the **content-at-Ritual / styling-at-Skin** boundary: every visible character originates in Ritual's pre-rendered label fields; Skin's only render-time work is style assignment + spacing + panel chrome.
-
-2. **New invariants in degraded / partial-failure paths?** YES.
-   - `prose_enrichment=None` MUST render cleanly (no blank line, no "enrichment unavailable" copy). Epic 7 will populate it; Epic 3 must not leak the absence visually.
-   - **Pre-rendered labels are the boundary contract** — Ritual produces every visible string (`seed_quote`, `last_session_label`, `last_apps_label`, `available_modes_label`, `intro_lines`, `prompt_text`); Skin maps each to a fixed Rich style. No raw integers (durations), enums (states), tuples (apps), or component values (mode names) cross into Skin where Skin would have to format. This is the practical reading of project-context.md:64 "Skin renders what it receives; never makes decisions."
-   - **Progressive omission rules** locked by test (architecture.md:738-745, Story 3.3 reshape):
-     - `intro_lines == ()` → omit the entire preface block (State C path).
-     - `seed_quote is None` → omit the seed line (Ritual returns None for empty / null seed).
-     - `last_session_label is None` → omit the "Last session" line (Ritual returns None for: no last_session, null mode_name, deleted mode).
-     - `last_apps_label is None` → omit the "Apps:" line (Ritual returns None for: no snapshot, all-opaque windows).
-     - `available_modes_label is None` → omit the available-modes line (Ritual returns None for: empty modes, State A / C path).
-     - `prose_enrichment is None` → omit the prose paragraph (always None in Epic 3).
-     - `prompt_text is None` → omit the prompt (State A path; State B / C always have a prompt).
-   - **Duration-zero policy split**: `format_duration_seconds(0)` returns `"0s"` (a value-based formatter — zero seconds is a representable completed-session duration). Ritual's `_build_last_session_label` is the SINGLE policy site that omits the duration tail when `last_session.is_complete is False`. A short completed session renders accurately as `"Last session: Coding mode, 0s"`; an interrupted session renders as `"Last session: Coding mode"` (no tail). The two cases are NOT confused because the upstream signal is `is_complete`, not `duration_seconds == 0`.
-   - **Tier-orthogonality** in T1: `tier` rides on the ViewModel for downstream tier-notice rendering (Story 5.4) but does not change the A/B/C panel chrome in this story. Verified by parametrizing render tests across `(state, tier)` cells.
-   - **Suggested-mode tie-break determinism**: when multiple modes carry `is_default=True` (the warning logged by `nova.core.config._validate_default_mode_uniqueness` does not reject the config), Ritual MUST resolve to a single suggestion deterministically. The tie-break ladder is `(a) match last_session.mode_name if present and matching a configured stem → that ModeInfo; (b) most-recent last_used_at (lexicographic ISO sort, None is smaller than any string); (c) is_default=True mode with the alphabetically-first stem; (d) the alphabetically-first stem.` Locked by test.
-
-3. **Depends on prior-story state?** YES. Two locked predecessors:
-   - **Setup's `_render_state_a` (Story 2.4)** — direct Rich Panel render at [src/nova/setup/__main__.py:78-104](../../src/nova/setup/__main__.py#L78-L104). Setup keeps using its own renderer for the first-run pre-wizard path (no NovaApp exists at that point, no `BriefingAggregate` to assemble, no Brain to consult). Story 3.3 ships the **bare-`nova`-boot** render path — separate code site, identical visible output for State A. The pre-flag mandates "two renderers must coexist without divergence in visible output." Story 3.3 ships a parity test that locks byte-identical State A output between the two paths under `Console(record=True, width=80)` capture.
-   - **Story 1.9's `BriefingViewModel` placeholder shape** — the type lives at [src/nova/systems/ritual/models.py:26-51](../../src/nova/systems/ritual/models.py#L26-L51) with raw-component fields (`seed_text`, `last_mode`, `last_duration_seconds`, `last_apps`). **Story 3.3 ships a more substantial reshape than originally pre-flagged**: rather than a single rename to `last_duration_display`, the four raw-component fields are removed and replaced by five pre-rendered label fields (`intro_lines`, `seed_quote`, `last_session_label`, `last_apps_label`, `available_modes_label`). The reshape is safe today because no runtime code populates `BriefingViewModel` (the type is declared but unused — Story 3.2 did not touch it, see Story 3.2 § Open question 3). The shape change is locked by `test_briefing_view_model_field_set_matches_ac_3_3` (AC #3) and by the regression-guard assertion that the four removed names are NOT present.
-
-**Classification result:** ✅ **Interaction-boundary story.** Apply full A1 invariant sweep (lifecycle, teardown, concurrency / cancellation, error translation, test determinism, Review Focus subsection). Apply A9 degraded-path proof (happy / degraded / rerun categories). Apply A10 prior-state reconciliation (this section + the visual-parity test).
+**Interaction-boundary story** (Epic 2 retro A6 — pre-flagged in [epic-3-story-preflags.md:24-33](epic-3-story-preflags.md#L24-L33)). First production use of the Ritual → Skin pipeline; introduces the **content-at-Ritual / styling-at-Skin** boundary and the **progressive omission** rendering invariant. Full A1 invariant sweep applied (see § Review Focus). A9 degraded-path proof + A10 prior-state reconciliation locked by the visual-parity test against setup's `_render_state_a`.
 
 ## Depends on prior-story state (A10)
 
-### Story 3.2 locked: `BriefingAggregate` + `BriefingState` + `ModeInfo`
-
-- [`src/nova/systems/brain/models.py:206-228`](../../src/nova/systems/brain/models.py#L206-L228) ships `BriefingAggregate` with all five fields populated by [`nova.systems.nerve.briefing.load_briefing_aggregate`](../../src/nova/systems/nerve/briefing.py#L65-L113). `recent_memory` is **always** an empty tuple `()` in T1 (Story 3.2 § Explicit non-goals). Story 3.3's `RitualSystem.build_briefing` does not consult `recent_memory` — Epic 4 / Epic 7 will populate it and Epic 7 will route it into prose enrichment.
-- [`src/nova/core/types.py:44-56`](../../src/nova/core/types.py#L44-L56) declares `BriefingState` as a `StrEnum` (`FIRST_RUN`, `POST_SETUP`, `WARM_RESUME`). Story 3.3 imports from `nova.core.types`, never re-declares.
-- [`src/nova/systems/brain/models.py:118-162`](../../src/nova/systems/brain/models.py#L118-L162) ships the Story 3.2 reshape of `ModeInfo`: `stem` (canonical identifier — what `sessions.mode_name` stores), `display_name` (user-facing label from YAML `name:`), `app_count`, `is_default`, `last_used_at: str | None` (ISO-8601 UTC, lexicographically sortable). Story 3.3 reads `display_name` for `prompt_text` formatting and reads `stem` for the "match `last_session.mode_name`" tie-break. Renaming a mode YAML's `name:` after a session has been recorded leaves history queryable (the stem is stable) and only changes the rendered label — Story 3.3's tests force `stem != display_name` so a regression that collapses the two surfaces.
-
-### Story 3.1 locked: `SessionSummary.is_complete` is the interrupted-session signal
-
-[`src/nova/systems/brain/models.py:50-72`](../../src/nova/systems/brain/models.py#L50-L72) ships `SessionSummary` with two fields that Story 3.3 reads:
-- `duration_seconds: int` — always populated; for interrupted sessions (`ended_at IS NULL`) Story 3.1 stores `0`.
-- `is_complete: bool` — coerced from SQLite INTEGER 0/1; `False` means the session was interrupted before clean shutdown, `True` means clean shutdown.
-
-**Story 3.3 keys the interrupted-vs-completed render policy on `is_complete`, NOT on `duration_seconds == 0`.** A short completed session can have `duration_seconds == 0` (e.g., user typed `shutdown` immediately after boot). Treating zero-duration as a synonym for "interrupted" would silently relabel a real completed session as interrupted — wrong UX signal. The policy split:
-- `format_duration_seconds(seconds: int) -> str` is **value-based**: `0 → "0s"`, `45 → "45s"`, `6120 → "1h 42m"`. The formatter does NOT encode session-state policy.
-- Ritual's `_build_last_session_label` is the **policy site**: when `last_session.is_complete is False`, omit the duration tail; otherwise call the formatter and append.
-
-This split is documented in the formatter's module docstring (AC #5) and locked by AC #24's `test_state_c_with_completed_session_zero_duration_renders_zero_seconds` (asserts `"Last session: Coding mode, 0s"` for a 0-second completed session) plus `test_state_c_with_interrupted_session_omits_duration` (asserts duration tail omitted for `is_complete=False`).
-
-### Story 1.9 locked: `BriefingViewModel`, `RitualPort`, `SkinPort` placeholder shapes
-
-- [`src/nova/systems/ritual/models.py:26-51`](../../src/nova/systems/ritual/models.py#L26-L51) ships the placeholder `BriefingViewModel` with raw-component fields (`seed_text`, `last_mode`, `last_duration_seconds`, `last_apps`). Story 3.3 ships a **more substantial reshape than originally pre-flagged**: the four raw-component fields are removed and replaced by five pre-rendered label fields (`intro_lines`, `seed_quote`, `last_session_label`, `last_apps_label`, `available_modes_label`). The reshape moves content composition out of Skin (where it would otherwise land per the original raw-field design) and into Ritual, where architecture.md:753 says ViewModel population belongs. The reshape is safe today because no runtime code populates the dataclass — Story 3.2 did not touch it (Story 3.2 § Open question 3). See § Group A for the full field shape; § Architecture Decision 3b vs. shipped ViewModel for the deviation rationale.
-- [`src/nova/ports/ritual.py`](../../src/nova/ports/ritual.py) declares `RitualPort.build_briefing(aggregate, state, tier) -> BriefingViewModel` and `RitualPort.begin_shutdown() -> ShutdownData`. Story 3.3 ships a concrete `RitualSystem` class implementing both methods — `build_briefing` with a real body, `begin_shutdown` with `raise NotImplementedError("Story 3.7 scope")`. The `NotImplementedError` keeps the structural-Protocol shape valid (mypy strict checks shape, not body); Story 3.7 fills the body when the shutdown flow lands.
-- [`src/nova/ports/skin.py`](../../src/nova/ports/skin.py) declares the six T1 SkinPort methods: `render_briefing_card`, `render_progress`, `render_shutdown_card`, `render_response`, `collect_input`, `parse_command`. Story 3.3 ships a concrete `RichSkinAdapter` class with `render_briefing_card` populated and the other five raising `NotImplementedError("Story 3.X scope")` — `parse_command` defers to Story 3.4, `render_progress` to Story 3.6, `render_shutdown_card` / `render_response` / `collect_input` to Story 3.7. The placeholder bodies are unrelaxed by mypy (Protocol methods have ellipsis bodies; concrete `NotImplementedError` raises are valid concrete implementations).
-
-### Story 2.4 locked: setup's `_render_state_a` body + the State A copy contract
-
-[`src/nova/setup/__main__.py:78-104`](../../src/nova/setup/__main__.py#L78-L104) renders State A with the **locked verbatim copy** (Story 2.4 AC #1, [test_setup_init.py::test_state_a_body_contains_first_session_line](../../tests/unit/setup/test_main.py)):
-
-```text
-First session. No history yet — that's expected.
-Let's set up your first workspace mode so tomorrow starts warm.
-```
-
-Title: `[bold cyan]N.O.V.A.[/bold cyan]`. Border: cyan. Padding: `(1, 2)`. Body styled `bright_white` per line.
-
-Story 3.3's `RichSkinAdapter.render_briefing_card` MUST produce **byte-identical Console-recorded output** for State A. Locked by `test_state_a_render_matches_setup_render_state_a_byte_for_byte` (AC #18). Setup's renderer is **NOT** modified by this story — the pre-flag's "must coexist without divergence" reading. Setup runs before any NovaApp exists; bare-`nova` runs through Nerve→Ritual→Skin. Two code paths, one visual contract.
-
-**Why setup is not rerouted to use `RichSkinAdapter`:** at setup time there is no `NovaApp`, no Brain, no `BriefingAggregate`. Constructing an empty aggregate purely to call `RitualSystem.build_briefing` for its State A pass-through is forced architecture. Setup's `_render_state_a` stays as the single source for the setup-time render; the parity test is the contract that catches divergence. If a later cleanup story (post-Epic 3) wants to merge the two render sites, the parity test makes the merge mechanical — both paths already produce identical output. Until then, "two renderers, one parity-locked contract" is the explicit pre-flag instruction.
-
-### UX spec locked: design system + state contract
-
-- [`_bmad-output/planning-artifacts/ux-design-specification.md:746-805`](../planning-artifacts/ux-design-specification.md#L746-L805) — Briefing Card State Contract (T1) defines the body copy for B and the seed-quote / "Last session: …" / "Apps: …" / resume-prompt skeleton for C.
-- [`_bmad-output/planning-artifacts/ux-design-specification.md:392-431`](../planning-artifacts/ux-design-specification.md#L392-L431) — color system (`#5FB4D9` cyan = Rich `cyan`, `#E8E8E8` bright_white = Rich `bright_white`, `#C0C0C0` body white = Rich default text style, `#6B6B6B` dim gray = Rich `dim`) and typography hierarchy (panel title bold cyan, seed bold bright_white as the hero line, supporting context dim gray, prompt as final bold line).
-- [`_bmad-output/planning-artifacts/ux-design-specification.md:432-450`](../planning-artifacts/ux-design-specification.md#L432-L450) — spacing / layout (vertical flow only, panel padding `(1, 2)`, no horizontal scrolling, content wraps).
-
-The design system is implemented in this story as the literal Rich style strings (`"bold cyan"`, `"bold bright_white"`, `"dim"`, `"bright_white"`). Future centralization (a `nova.core.styles` module mapping semantic names to Rich style strings) is **out of scope** for Story 3.3 — Skin adapter is the only user today; centralization is YAGNI until a second consumer (e.g., the Knowledge Display in Epic 5) needs the same vocabulary.
-
-### Architecture decision locked: Render Responsibility Boundary
-
-[`_bmad-output/planning-artifacts/architecture.md:747-755`](../planning-artifacts/architecture.md#L747-L755) — table of who-decides-what:
-
-| Concern | Owner | NOT owned by |
-|---|---|---|
-| Which state applies (A/B/C) | Nerve (Story 3.2) | Brain, Ritual |
-| Assembling the view model, populating UI fields (`title`, `prompt_text`, `auto_start_setup`) | **Ritual (this story)** | Nerve, Skin |
-| Generating prose enrichment | Voice (Epic 7) | Ritual, Skin |
-| Mapping view model fields to Rich components | **Skin (this story)** | Ritual, Voice |
-
-Story 3.3 ships the two **Ritual** + **Skin** rows. Skin makes **zero content decisions** — the adapter receives a fully-populated `BriefingViewModel` and maps fields to Rich primitives mechanically. Locked by `test_skin_makes_no_content_decisions` (AC #20): same ViewModel → byte-identical Rich output across runs (idempotency + determinism).
+| From | What's load-bearing for Story 3.3 |
+|---|---|
+| Story 3.2 — [systems/brain/models.py:206](../../src/nova/systems/brain/models.py#L206) | `BriefingAggregate` (`recent_memory` always `()` in T1) + [`ModeInfo`](../../src/nova/systems/brain/models.py#L118) (stem / display_name / is_default / last_used_at ISO string). |
+| Story 3.2 — [core/types.py:44](../../src/nova/core/types.py#L44) | `BriefingState` StrEnum (FIRST_RUN / POST_SETUP / WARM_RESUME). |
+| Story 3.1 — [systems/brain/models.py:50](../../src/nova/systems/brain/models.py#L50) | `SessionSummary.is_complete: bool` is the interrupted-session signal. **Story 3.3 keys interrupted-vs-completed on `is_complete`, NOT on `duration_seconds == 0`** — a short completed session can have `duration_seconds == 0` and must render as `"Last session: X mode, 0s"`. The formatter is value-based; Ritual is the policy site. |
+| Story 1.9 — [systems/ritual/models.py](../../src/nova/systems/ritual/models.py) | `BriefingViewModel` placeholder + `RitualPort` / `SkinPort` Protocols. Story 3.3 reshapes `BriefingViewModel` from 4 raw-component fields to 5 pre-rendered label fields — see Group A. |
+| Story 2.4 — [setup/__main__.py:78](../../src/nova/setup/__main__.py#L78) | `_render_state_a` is the visual-parity target. Two coexisting renderers (setup-time + bare-`nova` boot) locked to byte-identical output by the AC #20 parity test. |
+| UX spec — [ux-design-specification.md:746-805](../planning-artifacts/ux-design-specification.md#L746-L805) | Briefing Card State Contract (body copy + state structure) + [color/typography](../planning-artifacts/ux-design-specification.md#L392-L450). Implemented as literal Rich style strings; centralization deferred until a second consumer needs it. |
+| Architecture — [architecture.md:747-755](../planning-artifacts/architecture.md#L747-L755) | Render Responsibility Boundary table — Ritual assembles ViewModel, Skin maps fields to Rich components. Story 3.3 ships both rows. |
 
 ## Acceptance Criteria
 
@@ -865,123 +792,52 @@ Per-spec ladder ordering (rung b before rung c is correct), test-helper hardcode
 
 ### Pattern library consulted
 
-- **#2 AST guards** — two new isolation tests (`test_ritual_isolation.py`, `test_skin_adapter_isolation.py`) plus two new positive composition-root instantiation tests.
-- **#3 frozen dataclass** — `BriefingViewModel` reshape stays `frozen=True`. `RitualSystem` is a stateless class (zero fields); `RichSkinAdapter` is a class with a single `Console` reference (dataclass would not gain anything; the adapter has no mutable state requiring frozen-dataclass protection).
+- **#2 AST guards** — `test_ritual_isolation.py` + `test_skin_adapter_isolation.py` + two new positive composition-root instantiation tests.
+- **#3 frozen dataclass** — `BriefingViewModel` reshape stays `frozen=True`; `RitualSystem` and `RichSkinAdapter` are plain classes (stateless / single-Console-ref respectively, no value-object semantics to protect).
+- **#7 partial-init cleanup** — both new resources are stateless with no external handles; the existing `except BaseException: await storage.close()` block in `create_app` covers them. AC #31 adds a regression test.
 
-### Pattern NOT consulted (and why)
+Patterns NOT consulted: #1 clock indirection (no timestamps), #4 error translation (no new translation surface), #5 skip-on-error (no file loading), #6 transaction CM (no DB writes).
 
-- **#1 clock indirection** — pure transformation; no timestamp stamping in this story.
-- **#4 error translation** — encoding errors at the terminal boundary belong at the entrypoint (Story 3.5 / `cli.py`), not at the renderer.
-- **#5 per-file skip-on-error** — no file loading.
-- **#6 transaction CM** — no DB writes.
-- **#7 partial-init cleanup** — both new resources (`RitualSystem`, `RichSkinAdapter`) are stateless with no external handles; the existing `try: except BaseException: await storage.close()` block in `create_app` already covers any future failure during their construction. AC #31 adds a regression test for this.
+### Architecture Decision 3b deviation — pre-rendered labels at the Ritual → Skin boundary
 
-### Why pre-rendered labels and not raw component fields
+`BriefingViewModel` ships with 13 pre-rendered label fields, not the raw-component shape (`seed_text` / `last_mode` / `last_duration: timedelta` / `last_apps`) listed in [architecture.md Decision 3b](../planning-artifacts/architecture.md#L677-L713). Three reasons:
 
-Architecture.md Decision 3b's original ViewModel design used raw component fields (`seed_text`, `last_mode`, `last_duration: timedelta`, `last_apps: list[str]`) on the assumption that Skin would compose rendered lines from them. Story 3.3 deviates: every visible string is pre-rendered by Ritual, and Skin maps each to a fixed style. Three reasons:
+1. **"Skin makes zero content decisions"** (project-context.md:64) is load-bearing — composing `f"Last session: {mode} mode, {duration}"` in Skin is content composition.
+2. **Pre-flag's serialization-at-boundary invariant generalizes** beyond duration to every component value (singular/plural mode count, opaque-window filtering, seed quoting).
+3. **Centralized formatting** (project-context.md:57) — `nova.core.formatting.format_duration_seconds` is reachable from every consumer that builds a ViewModel-like structure.
 
-1. **"Skin makes zero content decisions" is the load-bearing rule.** project-context.md:64 ("Voice generates text; Skin renders it") + project-context.md (Skin renders what it receives) + architecture.md:753 (Ritual owns "assembling the view model, populating UI fields") all push the boundary toward Ritual. Composing `f"Last session: {last_mode} mode, {last_duration_display}"` in Skin is content composition (chooses the prefix label, decides comma placement, decides "mode" suffix). With the reshape, Ritual produces the literal string `"Last session: Coding mode, 1h 42m"` and Skin only chooses the `dim` style.
+A future architecture.md revision pass (post-Epic 3 retrospective) would reflect the shipped shape.
 
-2. **The pre-flag's serialization-at-boundary invariant generalizes.** The pre-flag (epic-3-story-preflags.md:30) called out duration specifically: no `timedelta` crossing layers; pre-formatted string only. The same logic applies to every other component value — singular/plural mode count, mode-name labeling, opaque-window filtering. The reshape applies the invariant uniformly: the boundary is `str | None`, never raw component data.
+### State C with the setup row is the first-session-2 card, not "no resumable context"
 
-3. **Centralized formatting (project-context.md:57).** The new `nova.core.formatting.format_duration_seconds` is the single home for duration formatting. Future consumers (transparency display in Epic 5, mode-restore feedback in Story 3.6, audit-trail render in Epic 5) call the same function. By placing the formatter call in Ritual (not Skin), every consumer that builds a ViewModel-like structure goes through the same vocabulary.
-
-**Trade-off accepted:** the ViewModel grew from 12 to 13 fields, and the field semantics shifted from "data" to "rendered text." Both are conscious choices documented in AC #1 and § Architecture Decision 3b vs. shipped ViewModel.
-
-### Why `RitualSystem` is not a dataclass
-
-Dataclasses are for value objects. `RitualSystem` is a stateless service — it has methods but no fields. A `@dataclass(frozen=True)` declaration with zero fields would compile but give no benefit (no `__init__` parameters to enforce, no `__eq__` semantics that matter — every instance is interchangeable). A plain class is the right shape; any future state (e.g., a Voice port reference for Epic 7) gets added to `__init__` deliberately, with the dataclass decision re-evaluated then.
-
-### Why `RichSkinAdapter` is not a dataclass
-
-Same reason scaled up. The adapter holds one mutable reference (the `Console` — Rich's `Console` is a stateful sink, not an immutable value), so `frozen=True` would be wrong. A plain class with `__init__(self, console: Console)` is the right shape; matches the existing `NoOpShieldAdapter` precedent (Story 1.9 stateless adapter as plain class) and the `SqliteBrainAdapter` precedent (Story 3.1 stateful adapter as plain class with `__init__(self, storage)`).
-
-### Why `last_apps_label` is derived from `WorkspaceSnapshot.windows`, not pre-stored
-
-Story 2.4 / Story 3.1 chose `WorkspaceSnapshot.windows: tuple[WindowContext, ...]` as the canonical shape — each window carries `app_name`, `window_title`, `process_name`, `is_opaque`. The "Apps:" line in the Briefing Card needs only the app-name list (filtered for non-None and joined by `", "`). Two design options were considered:
-
-- **(A)** Add a `last_apps: tuple[str, ...]` field to `BriefingAggregate`, computed by Brain in `load_briefing_aggregate`.
-- **(B)** Build `last_apps_label: str | None` in Ritual from `last_snapshot.windows`.
-
-(B) is what Story 3.3 ships, because:
-- Brain owns the **storage projection**, not the **render projection**. Adding a render-shaped field to `BriefingAggregate` mixes concerns and adds work to Brain that is purely Ritual's concern.
-- The transformation is two lines (filter `app_name is not None`, then `f"Apps: {', '.join(...)}"`). Caching it in `BriefingAggregate` would not save meaningful work at T1 scale.
-- A future story that needs *both* the windows tuple (for richer rendering — e.g., focus indicators in Epic 6) and the apps label (for the briefing card) can let each consumer derive what it wants. Storing both is duplication.
-
-**Note:** Skin never sees `WindowContext`. The cross-system surface is Ritual ← Eyes (`WorkspaceSnapshot` + `WindowContext` from `nova.systems.eyes.models` per Story 1.9 AC #8) → Skin (`last_apps_label: str | None` only).
-
-### Why setup's `_render_state_a` is not deleted
-
-The pre-flag note says "scaffolding that this story replaces" — read pragmatically as "replaces in the bare-`nova` boot path" (which is what Story 3.5 wires). Setup runs *before* a `NovaApp` exists; rerouting setup's State A through Ritual+Skin would require either:
-- (a) Constructing an empty `BriefingAggregate` and instantiating a `RitualSystem` purely to call `build_briefing(empty_aggregate, FIRST_RUN, OFFLINE)` — then a `RichSkinAdapter(console)` — wrapped in `asyncio.run` from setup's sync `main`.
-- (b) Inlining a State A ViewModel construction in setup and calling `RichSkinAdapter(console).render_briefing_card(view_model)` (still wrapped in `asyncio.run`).
-
-Both add overhead. The visual-parity test (AC #20) is the contract that catches divergence — if the two renderers ever produce different output, the test fails on the next CI run. Setup keeps its own renderer until a future cleanup decides the consolidation is worth one more `asyncio.run` boundary.
-
-### State C with the setup row is the **first-session-2 card**, not "no resumable context"
-
-Story 3.2 § "State B is NOT the normal post-setup path in T1" is mandatory reading. Story 3.3's render must NOT label State B as "the post-setup briefing" — that mislabel would make the user-visible UX claim "session 2 lands on State B," which is wrong. The first-session-2 card is **State C with progressive omission** (no seed line, no last-session line, no apps line — only the panel chrome and the resume prompt resolved via the suggested-mode ladder). Test naming reflects this: `test_state_c_with_setup_row_only_omits_progressively` is the name of the regression; the State B test names emphasize "no available data + seed null" or "interrupted session" (the actual State B paths in T1).
-
-The user-visible result for a fresh session 2 (post-setup, no completed work session yet, no seed) is a Briefing Card with the cyan border, "Session Briefing" title, and ONE bold line: `"Resume {default_mode} mode?"` (or `"What mode?"` if no default — but Story 2.3's wizard requires a default). That is the architecture's intended cold-start render, surfaced cleanly via progressive omission. The next session — when the user has actually completed a session and planted a seed — surfaces the full State C card.
-
-### Suggested-mode ladder design rationale
-
-The four-rung ladder (last-session-match → most-recent-used → default → alphabetical) is borrowed from the architecture.md:727 table description ("most recent or default") and elaborated to handle ties deterministically. The architecture phrases it as a heuristic; Story 3.3 elevates it to a deterministic ladder so the test can assert specific outputs. The first-match-wins discipline mirrors Nerve's `determine_briefing_state` ladder (Story 3.2) — same idiom, similar style.
-
-The "alphabetically-first stem" tie-break is **stable** under YAML edits — renaming a mode YAML's `name:` field changes `display_name` but not `stem` (the filename). Tests force `stem != display_name` to lock the contract that the alphabetical sort is on `stem`, not on `display_name`.
+Story 3.2 § "State B is NOT the normal post-setup path in T1" is the source. The first-session-2 card is **State C with progressive omission** (no seed, no last-session line, no apps — only the panel chrome and the resume prompt). State B is reachable only via (a) user hand-edited mode YAML before ever running `nova`, or (b) a prior session was interrupted before seed capture.
 
 ### Render-time omission rule: empty string vs. None
 
-The reshape moves the truthy-vs-`is not None` distinction from the renderer to Ritual's helpers (where the empty-string-vs-None decision is now made), but the rule is the same:
-
-- For `seed_quote`, the **producer** (`_build_seed_quote` in Ritual) uses a truthy check (`if last_seed:`) — a legitimate seed cannot be the empty string (Story 3.7's shutdown flow rejects empty input — "Please confirm or cancel" — so empty seed never reaches storage). Empty-string-as-input from a corrupted DB row produces `seed_quote = None`, which Skin then omits via `is not None`. Locked by AC #24's `test_state_c_with_empty_seed_string_omits_seed_quote`.
-
-- For all other label fields (`last_session_label`, `last_apps_label`, `available_modes_label`, `prompt_text`, `prose_enrichment`) and the empty-tuple `intro_lines == ()`, the omission signal is `None` / `()`. These fields are NEVER the empty string — Ritual either produces a non-empty label or returns `None` directly. Skin's omission check is uniformly `is not None` for `str | None` fields and `if value` for the tuple field. No category errors: absent (None / empty tuple) is one signal; present (non-empty string / non-empty tuple) is the other.
-
-### Coexistence-without-divergence is testable
-
-The pre-flag note's "two renderers must coexist without divergence in visible output" is enforced by AC #20's parity test (plain text + ANSI). Both are `Console(record=True, width=80, color_system=...)` captures, compared byte-for-byte. A regression that changes either renderer's State A output (e.g., setup adding a "v0.1" tagline in a future polish pass, or RichSkinAdapter shifting from `padding=(1, 2)` to `padding=(2, 2)`) flips the test red on the next CI run. The test is the spec.
-
-If Story 3.5's bare-`nova` boot wiring chooses to merge the two renderers (e.g., reroute setup's State A through `RichSkinAdapter` once the asyncio plumbing is in place), the parity test is the migration's safety net — both paths already produce identical output, so the merge is pure deduplication.
+- `seed_quote`: Ritual's `_build_seed_quote` uses a truthy check (`if last_seed:`) — Story 3.7's shutdown rejects empty input upstream, so empty-string-as-input is data-corruption defense-in-depth and produces `seed_quote = None`.
+- All other label fields: NEVER the empty string. Ritual either produces a non-empty label or returns `None`. Skin's omission check is `is not None` for `str | None` fields and `if value` for `intro_lines: tuple[str, ...]`.
 
 ### `tier` rides through the ViewModel but does nothing in Epic 3 render
 
-The `BriefingViewModel.tier` field exists for Story 5.4's tier-notice rendering (separate Skin method, not `render_briefing_card`) and Epic 7's prose-enrichment-availability decision (Voice consults tier before generating prose). Story 3.3's `render_briefing_card` ignores the field — every test parametrizes `(state, tier)` and asserts byte-identical output across tier values. If a future story decides State B / C should carry an inline degraded notice (instead of a separate amber line above the panel), that story changes the rule and updates these parametrize tests; until then, tier-orthogonality is the contract.
+`tier` is on the ViewModel for Story 5.4's tier-notice render path (separate Skin method) and Epic 7's prose-enrichment availability. Epic 3's `render_briefing_card` is tier-orthogonal — every test parametrizes `(state, tier)` and asserts byte-identical output across tiers.
 
 ### Why `NotImplementedError` and not `pass` for the unfilled `RichSkinAdapter` methods
 
-`pass` would silently no-op the method. `parse_command("shutdown")` returning `None` (since the body is `pass`) would be a bug Story 3.4 would have to discover via crashing tests. `NotImplementedError("Story 3.X scope")` makes the seam loud — the first call site of any unimplemented method (in Story 3.4 / 3.6 / 3.7) hits a clear exception that names the responsible story. Same precedent as the Story 3.1 Brain Epic-5 stubs (`raise NotImplementedError("Epic 5 scope")`).
+`pass` silently no-ops; the unfilled method's first caller (in Stories 3.4 / 3.6 / 3.7) would have to discover it via crashing tests. `NotImplementedError("Story 3.X scope")` makes the seam loud — same precedent as Story 3.1's Brain Epic-5 stubs.
 
 ### Explicit scope fence (non-goals)
 
-- Story 3.3 does NOT call the new pipeline from `nova.cli.main` — Story 3.5 owns that wiring (Nerve session lifecycle) and the bare-`nova` entrypoint.
-- Story 3.3 does NOT modify [`src/nova/setup/__main__.py`](../../src/nova/setup/__main__.py). Setup's `_render_state_a` keeps rendering State A directly via Rich Panel construction; the parity test enforces visual equivalence.
-- Story 3.3 does NOT generate `prose_enrichment`. Voice + Claude integration is Epic 7. The field is `None` in every Epic 3 ViewModel.
-- Story 3.3 does NOT implement the tier-notice render path (the separate amber line above the panel for `DEGRADED` / `OFFLINE`). That is Story 5.4 (tier status display + notification). Skin's `render_briefing_card` is tier-orthogonal.
-- Story 3.3 does NOT implement `parse_command`, `render_progress`, `render_shutdown_card`, `render_response`, `collect_input`. Each raises `NotImplementedError` with the target story number; the bodies land in Stories 3.4 / 3.6 / 3.7.
-- Story 3.3 does NOT implement `RitualSystem.begin_shutdown`. It raises `NotImplementedError("Story 3.7 scope")`.
-- Story 3.3 does NOT add a `WorkspaceSnapshot.apps` derived field. The derivation lives in `RitualSystem.build_briefing` per the design rationale above.
-- Story 3.3 does NOT centralize Rich style strings into a `nova.core.styles` module. The literal style strings appear at the Skin renderer call sites; centralization is YAGNI until a second consumer exists.
-- Story 3.3 does NOT de-duplicate repeated app names when building `last_apps_label`. T1 scale makes the duplication visible-but-tolerable (`"Apps: Chrome, Chrome"` is accurate, just verbose); the first consumer that needs deduplication owns it.
-- Story 3.3 does NOT change `BriefingAggregate` shape. Story 3.2's reshape is final; Ritual reads through.
-- Story 3.3 does NOT introduce a settings flag for "show prose enrichment when available." The `prose_enrichment != None` rendering branch is tested with a fixture-supplied value; the production wiring of Voice → ViewModel is Epic 7's concern.
-- Story 3.3 does NOT add timing instrumentation for the < 5s briefing NFR (PRD NFR3). Story 3.5 (Nerve session lifecycle) is the natural home for end-to-end timing — it owns the bare-`nova` boot path that the NFR measures.
-
-### Open questions resolved during SM authoring
-
-1. **Should setup's `_render_state_a` route through the new pipeline?** — NO. The pre-flag's "two renderers must coexist without divergence" is satisfied by the parity test. Setup runs before a NovaApp exists; rerouting adds asyncio overhead with no architectural benefit. See § Why setup's `_render_state_a` is not deleted.
-
-2. **Should the ViewModel reshape be a single `last_duration_display` rename or a broader move to pre-rendered labels?** — Broader. Initial draft had only the duration rename per the pre-flag. Code-review feedback identified that as inconsistent: Skin would still own the State B preface text, the singular-vs-plural "Available mode(s)" decision, the seed-quote wrapping, and the "Last session: {mode} mode, {duration}" composition — all content decisions. The reshape applies the pre-flag's serialization-at-boundary invariant uniformly: every field crossing Ritual → Skin is either pre-rendered text or a behavioral-metadata signal (state, tier). See § Why pre-rendered labels and not raw component fields.
-
-3. **`suggested_mode: ModeInfo | None` or `str | None`?** — `ModeInfo | None`. The current model already says `ModeInfo | None`; the AC says `suggested_mode` (no type) and the architecture.md table says `str | None` ("most recent or default" — implies a name string). The richer `ModeInfo` form is what's already shipped (Story 1.9) and what tests across this story expect. Skin formats `prompt_text` from `suggested_mode.display_name`; if Story 3.3 collapsed to `str`, Ritual would need to embed the display_name into prompt_text and Skin would lose access to the full mode metadata — useful for Story 5.4's tier display and Epic 7's prose. Keep the `ModeInfo` form.
-
-4. **Where does `format_duration_seconds` live?** — `nova.core.formatting` (new module). project-context.md:57 dictates centralization; Story 3.3 introduces the first centralized formatter. Future formatters (datetime, mode-name normalization) join the same module.
-
-5. **Should the renderer use Rich's markup string syntax or `rich.text.Text` builder?** — Either; the AC #17 narrative uses the markup form for compactness ("[bold cyan]…[/bold cyan]") but the implementer may use `Text.append(..., style="bold cyan")` if it reads more clearly. Tests assert structural content (substring presence + line ordering) and ANSI byte equality (parity test) — they do not constrain the construction style.
-
-6. **Does the `RitualSystem` constructor need a `Voice` reference for prose enrichment?** — Not in T1. Epic 7's wiring will add it; Story 3.3's `RitualSystem` is parameterless. When Epic 7 lands, `RitualSystem.__init__(self, voice: VoicePort)` — at that point the composition root passes the `voice` adapter through. Forward-compatible because `prose_enrichment=None` already renders cleanly today.
-
-7. **Should `render_briefing_card` clear the screen before printing?** — NO. The setup's `_render_state_a` does not clear; the bare-`nova` boot will not clear; the user's terminal scrollback is preserved. Story 3.5's command loop manages the prompt position; the briefing card does not own its own clear behavior.
+- Does NOT call the new pipeline from `nova.cli.main` — Story 3.5 owns that wiring.
+- Does NOT delete setup's `_render_state_a` — coexistence is the explicit pre-flag instruction; parity test enforces visual equivalence. (P2 patch updated setup symmetrically to use `Text("N.O.V.A.", style="bold cyan")` so the ANSI byte-stream matches.)
+- Does NOT generate `prose_enrichment` — Voice + Claude is Epic 7.
+- Does NOT implement the tier-notice render path — Story 5.4.
+- Does NOT implement `parse_command` / `render_progress` / `render_shutdown_card` / `render_response` / `collect_input` — Stories 3.4 / 3.6 / 3.7.
+- Does NOT implement `RitualSystem.begin_shutdown` — Story 3.7.
+- Does NOT add a `WorkspaceSnapshot.apps` derived field — Ritual derives `last_apps_label` from `last_snapshot.windows`.
+- Does NOT centralize Rich style strings into `nova.core.styles` — YAGNI until a second consumer exists.
+- Does NOT de-duplicate repeated app names — first consumer that needs dedup owns it.
+- Does NOT change `BriefingAggregate` shape — Story 3.2 final.
+- Does NOT add timing instrumentation for NFR3 — Story 3.5 owns end-to-end timing.
 
 ## Review Focus (boundary-first invariant sweep)
 
@@ -1054,10 +910,9 @@ Story 3.3 introduces TWO new `nova.systems` modules and ONE new `nova.adapters` 
 
 ### Detected conflicts or variances
 
-- **`BriefingViewModel` raw-component fields (Story 1.9, architecture.md Decision 3b) vs. pre-rendered label reshape (Story 3.3)** — Story 1.9 shipped `seed_text`, `last_mode`, `last_duration_seconds`, `last_apps` per architecture.md:689-712. Story 3.3's reshape removes those four and introduces five label fields (`intro_lines`, `seed_quote`, `last_session_label`, `last_apps_label`, `available_modes_label`). The deviation is documented in AC #1 and § Why pre-rendered labels and not raw component fields. Architecture.md is updated by reference — the AC narrative replaces the field design for this story; no architecture.md file edit is in scope. A future architecture.md revision pass (post-Epic 3 retrospective) would reflect the shipped shape.
-- **architecture.md:704 `last_duration: timedelta | None` vs. shipped `last_session_label: str | None`** — supersedes the architecture's `timedelta` (rejected by pre-flag for serialization-at-boundary) AND the intermediate `last_duration_display: str | None` (rejected during code review for keeping content composition in Skin). The shipped field carries the entire `"Last session: Coding mode, 1h 42m"` line as one pre-rendered string.
-- **architecture.md:638 `last_used_at: datetime | None` (on ModeInfo) vs. Story 3.2's shipped `last_used_at: str | None`** — already resolved by Story 3.2 with the same rationale (ISO strings at the port boundary, parse to datetime only at render-layer convenience). Story 3.3 inherits this and uses the ISO string directly for the lexicographic-sort tie-break in the suggested-mode ladder; no datetime parse is needed.
-- **architecture.md:727 `suggested_mode: str | None` vs. Story 1.9's shipped `suggested_mode: ModeInfo | None`** — Story 3.3 keeps the `ModeInfo` form. Documented in § Open question 3.
+- `BriefingViewModel` shipped shape diverges from architecture.md Decision 3b's raw-component field design — see § Architecture Decision 3b deviation in Dev Notes.
+- `last_used_at: str` (ISO string) supersedes architecture.md:638's `datetime | None` — Story 3.2 lock; ISO strings cross the port boundary, parse to datetime at the render layer only.
+- `suggested_mode: ModeInfo | None` supersedes architecture.md:727's `str | None` — Story 1.9 lock; richer form gives downstream consumers (Story 5.4 tier display, Epic 7 prose) full mode metadata.
 
 ## References
 
