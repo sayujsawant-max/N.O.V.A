@@ -100,6 +100,10 @@ PORT_CONTRACT: dict[ModuleType, tuple[str, tuple[str, ...]]] = {
             "get_last_seed",
             "store_snapshot",
             "get_last_snapshot_for_session",
+            # Story 3.2 addition — Nerve-side BriefingAggregate assembly
+            # queries Brain by mode stem (the canonical identifier, matching
+            # the sessions.mode_name write-side contract).
+            "get_mode_last_used",
             # Epic 5 surface retained on the port; adapter stubs each with
             # ``NotImplementedError("Epic 5 scope")`` until that epic ships.
             "query_memory",
@@ -738,11 +742,13 @@ def test_domain_models_use_tuple_not_list_for_sequence_fields(module: ModuleType
 def test_mode_info_is_distinct_from_mode_config() -> None:
     """``ModeInfo`` (Brain projection) is distinct from ``ModeConfig`` (Config schema).
 
-    ModeInfo is a minimal Brain-layer projection (name + usage metadata)
-    returned by ``BrainPort.load_briefing_aggregate``. ModeConfig is the
-    full file-backed schema (name + apps + folders + URLs) owned by
-    ``core/config.py``. Story 1.9 AC #5 locks the split — if a future
-    refactor collapsed them the field-shape guards below would fire.
+    ModeInfo is a Brain-layer projection (``stem`` + ``display_name`` +
+    usage metadata) assembled by Nerve's briefing layer (Story 3.2).
+    ModeConfig is the full file-backed schema (name + apps + folders +
+    URLs) owned by ``core/config.py``. Story 1.9 AC #5 locks the split;
+    Story 3.2 extended ModeInfo with ``app_count`` + ``is_default`` and
+    split ``name`` into ``stem`` + ``display_name``. The field-shape
+    guards below fire if a future refactor collapses the two types.
     """
     info_fields = {f.name for f in dataclasses.fields(ModeInfo)}
     config_fields = {f.name for f in dataclasses.fields(ModeConfig)}

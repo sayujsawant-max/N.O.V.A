@@ -39,10 +39,15 @@ from nova.systems.eyes.models import WorkspaceSnapshot
 class BrainPort(Protocol):
     """Persisted-fact surface owned by Brain.
 
-    T1 scope (Story 3.1): session lifecycle, seed retrieval, snapshot
-    storage/retrieval. Epic 5 scope: memory query, deletion, transparency.
-    Story 3.2 will add ``get_mode_last_used`` for Nerve-side
-    BriefingAggregate assembly.
+    T1 scope: session lifecycle, seed retrieval, snapshot
+    storage/retrieval, mode-usage lookup (Story 3.1 + 3.2). Epic 5
+    scope: memory query, deletion, transparency.
+
+    Story 3.2 added ``get_mode_last_used(mode_name)`` for Nerve-side
+    ``BriefingAggregate`` assembly. The ``mode_name`` parameter is the
+    canonical **stem** (dict key in :attr:`nova.core.config.NovaConfig.modes`)
+    — matching the write-side contract that ``sessions.mode_name``
+    stores the stem, not the display name.
     """
 
     async def create_session(self, mode_name: str | None, *, started_at: str | None) -> int: ...
@@ -63,6 +68,8 @@ class BrainPort(Protocol):
     async def store_snapshot(self, session_id: int, snapshot: WorkspaceSnapshotInput) -> None: ...
 
     async def get_last_snapshot_for_session(self, session_id: int) -> WorkspaceSnapshot | None: ...
+
+    async def get_mode_last_used(self, mode_name: str) -> str | None: ...
 
     async def query_memory(self, query: str) -> list[MemoryItem]: ...
 

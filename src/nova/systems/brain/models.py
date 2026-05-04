@@ -117,13 +117,48 @@ class MemoryItem:
 
 @dataclass(frozen=True)
 class ModeInfo:
-    """Brain-layer mode projection: name + usage metadata.
+    """Brain-layer mode projection: canonical stem + display label + usage metadata.
 
     Distinct from :class:`nova.core.config.ModeConfig`. See the module
     docstring for the rationale behind the two-type split.
+
+    Story 3.2 reshape (stem / display_name split)
+    ---------------------------------------------
+    ``stem`` and ``display_name`` are two independent identifiers. They
+    exist as separate fields to prevent a silent conflation between the
+    canonical mode identifier (filename-derived, stable, safe to use as
+    a dict key or a SQL value) and the user-facing label (editable in
+    YAML at any time, used purely for rendering).
+
+    Cross-story contract — ``sessions.mode_name`` stores the STEM, not
+    the display name. Stories 3.5 (Nerve session lifecycle), 3.6 (mode
+    restore), and 3.7 (shutdown flow) are responsible for honoring this
+    contract on the write side; Story 3.2 locks it on the read side by
+    querying :meth:`BrainPort.get_mode_last_used` with the stem only.
+    Renaming ``modes/coding.yaml``'s ``name: "Coding"`` to
+    ``name: "Deep Coding"`` therefore does not orphan any prior session
+    history — the stem ``coding`` persists in every session row and
+    every briefing lookup, while only the rendered label changes.
+
+    Field provenance
+    ----------------
+    - ``stem``: dict key in :attr:`nova.core.config.NovaConfig.modes`
+      (derived from the mode YAML file stem).
+    - ``display_name``: :attr:`nova.core.config.ModeConfig.name` (the
+      ``name:`` field in the mode YAML).
+    - ``app_count``: ``len(ModeConfig.apps)``.
+    - ``is_default``: :attr:`nova.core.config.ModeConfig.is_default`.
+      Multiple modes may carry this flag simultaneously; tie-break is
+      the consumer's concern (Story 3.3 / 3.5).
+    - ``last_used_at``: ISO-8601 UTC string from
+      :meth:`BrainPort.get_mode_last_used`, or ``None`` if the mode
+      has never appeared in a session row.
     """
 
-    name: str
+    stem: str
+    display_name: str
+    app_count: int
+    is_default: bool
     last_used_at: str | None
 
 

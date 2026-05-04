@@ -113,6 +113,14 @@ SELECT seed_text
  LIMIT 1
 """
 
+_SELECT_LAST_MODE_USAGE_SQL = """
+SELECT started_at
+  FROM sessions
+ WHERE mode_name = ?
+ ORDER BY id DESC
+ LIMIT 1
+"""
+
 _INSERT_SNAPSHOT_SQL = """
 INSERT INTO workspace_snapshots (session_id, captured_at, snapshot_type, workspace_data)
 VALUES (?, ?, ?, ?)
@@ -402,6 +410,40 @@ class SqliteBrainAdapter:
             snapshot_type=snapshot_type,
             windows=windows,
         )
+
+    async def get_mode_last_used(self, mode_name: str) -> str | None:
+        """Return the ``started_at`` of the most recent session with ``mode_name`` or None.
+
+        Consumed by Nerve's briefing-assembly layer (Story 3.2) to enrich
+        ``ModeInfo.last_used_at`` per configured mode. Returns the raw
+        ISO-8601 string from ``sessions.started_at``; callers needing a
+        ``datetime`` can parse it at the render layer via
+        ``datetime.fromisoformat``.
+
+        ``mode_name`` is the canonical **stem** (dict key in
+        ``NovaConfig.modes``) — matching the write-side contract that
+        ``sessions.mode_name`` stores the stem, not the display name.
+        Stories 3.5 / 3.6 / 3.7 own the write side of that contract;
+        this read-side method simply trusts equality against the stored
+        column value.
+
+        A mode that has never been used returns ``None``. Sessions with
+        ``mode_name IS NULL`` (e.g., the Story 2.4 setup row) never
+        match any stem — SQL NULL inequality semantics handle that
+        naturally. Empty ``mode_name`` input is accepted but returns
+        ``None`` because no session carries an empty string as a mode
+        (setup writes NULL; runtime writes populated stems).
+
+        Logging is DEBUG-only with no ``mode_name`` payload — mode names
+        can legitimately carry user-chosen text and the opacity rule
+        (project-context.md §Trust) keeps them out of log messages.
+        """
+        logger.debug("brain.get_mode_last_used start")
+        row = await self._storage.fetchone(_SELECT_LAST_MODE_USAGE_SQL, (mode_name,))
+        if row is None:
+            return None
+        started_at = row["started_at"]
+        return None if started_at is None else str(started_at)
 
     # ------------------------------------------------------------------
     # Epic 5 scope — declared to satisfy Protocol shape; NotImplementedError

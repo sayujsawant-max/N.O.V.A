@@ -1,5 +1,7 @@
 # generated: 2026-04-14
-# last_updated: 2026-04-21 (Story 3.1 code-review complete — three-layer adversarial review surfaced 1 decision-needed + 15 patches + 6 deferred + 2 dismissed. Decision resolved: BrainPort.end_session now returns stamped ended_at (str) so persist_first_run reuses it for the audit row and sessions.ended_at == audit_log.timestamp byte-exactly. All 16 patches batch-applied: zero-row WARNING on end_session, non-dict JSON guard in get_last_snapshot_for_session, 3 missing tests added (removed-methods regression, SqliteBrainAdapter-in-create_app AST positive case, mock-patch storage arg), spec contradictions reconciled. Full CI gate: 1341 passed + 1 skipped, 93.4% coverage. Story 3.1 status: review → done.)
+# Single `last_updated:` comment below mirrors the live `last_updated:` field on line ~38;
+# the field is the source of truth. Keep only the most recent change summary here — prior
+# epochs live in git history, not in stacked comments.
 # project: AI Assistant
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +37,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-14
-last_updated: 2026-04-21 (Story 3.1 complete: review → done. All 16 code-review patches applied; 1341 passed + 1 skipped, 93.4% coverage.)
+last_updated: 2026-05-04 (Story 3.2 fully done: 10 code-review patches applied, ruff + mypy + pytest all green locally. Final tally: 1377 of 1378 tests pass (1373 in default-capture pass + 4 setup_bat tests with -s). The 1 skipped is a pre-existing skip; zero failures. SAC permanently turned Off (Win11 Home one-way door). Diagnosed test_setup_bat.py pipe-deadlock root cause (pytest default capture × Windows subprocess handle inheritance) — workaround logged in deferred-work.md for a Story 2.1 follow-up. Status: review → done.)
 project: AI Assistant
 project_key: NOKEY
 tracking_system: file-system
@@ -70,7 +72,7 @@ development_status:
   # Epic 3: Core Session Loop (Hero Path)
   epic-3: in-progress
   3-1-brain-session-and-seed-persistence: done
-  3-2-briefingaggregate-and-state-determination: backlog
+  3-2-briefingaggregate-and-state-determination: done
   3-3-briefingviewmodel-and-briefing-card-rendering: backlog
   3-4-t1-command-grammar-and-deterministic-parser: backlog
   3-5-nerve-command-routing-and-session-lifecycle: backlog

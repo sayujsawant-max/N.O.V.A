@@ -324,6 +324,9 @@ async def test_get_last_snapshot_with_unknown_snapshot_type_translates_to_storag
             ),
             {},
         ),
+        # Story 3.2 addition — get_mode_last_used is a pure read via
+        # storage.fetchone, same identity-propagation contract.
+        ("get_mode_last_used", ("coding",), {}),
     ],
 )
 async def test_adapter_does_not_double_catch_storage_error_from_engine(
@@ -500,7 +503,12 @@ def test_sqlite_brain_adapter_structurally_satisfies_brainport(
     attribute catches accidental method deletion.
     """
     port: BrainPort = adapter  # mypy strict accepts the assignment
-    # Sanity: every port method attribute resolves on the adapter.
+    # Sanity: every port method attribute resolves on the adapter. This
+    # list must stay in lockstep with ``BrainPort`` in ``nova.ports.brain``
+    # and with ``PORT_CONTRACT[brain_port_module]`` in
+    # ``tests/unit/ports/test_port_isolation.py``. Adding a method to the
+    # port without updating this tuple gives a false pass (adapter "proves"
+    # conformance to a stale contract).
     for name in (
         "create_session",
         "end_session",
@@ -508,6 +516,7 @@ def test_sqlite_brain_adapter_structurally_satisfies_brainport(
         "get_last_seed",
         "store_snapshot",
         "get_last_snapshot_for_session",
+        "get_mode_last_used",  # Story 3.2 addition — parity with ports/brain.py
         "query_memory",
         "delete_matching",
         "confirm_deletion",
@@ -658,3 +667,122 @@ async def test_workspace_snapshot_is_deserialized_as_frozen_dataclass(
     assert isinstance(snap, WorkspaceSnapshot)
     with pytest.raises(AttributeError):
         snap.captured_at = "mutated"  # type: ignore[misc]
+
+
+# --- Story 3.2 — get_mode_last_used ----------------------------------------
+
+
+async def test_get_mode_last_used_returns_started_at_for_most_recent_session(
+    engine: SqliteStorageEngine,
+    adapter: SqliteBrainAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With two sessions for the same mode, the LATER one's started_at wins."""
+    monkeypatch.setattr("nova.core.events._utc_now_iso", lambda: "2026-04-20T09:00:00+00:00")
+    first_id = await adapter.create_session(mode_name="coding", started_at=None)
+    monkeypatch.setattr("nova.core.events._utc_now_iso", lambda: "2026-04-21T10:00:00+00:00")
+    second_id = await adapter.create_session(mode_name="coding", started_at=None)
+
+    assert second_id > first_id  # AUTOINCREMENT is monotonic
+
+    result = await adapter.get_mode_last_used("coding")
+    assert result == "2026-04-21T10:00:00+00:00"
+
+
+async def test_get_mode_last_used_returns_none_for_unused_mode(
+    adapter: SqliteBrainAdapter,
+) -> None:
+    """A mode that never appears in ``sessions.mode_name`` returns None."""
+    await adapter.create_session(mode_name="coding", started_at="2026-04-20T09:00:00+00:00")
+
+    assert await adapter.get_mode_last_used("writing") is None
+
+
+async def test_get_mode_last_used_returns_none_on_empty_db(
+    adapter: SqliteBrainAdapter,
+) -> None:
+    """No sessions at all — returns None, never raises."""
+    assert await adapter.get_mode_last_used("anything") is None
+
+
+async def test_get_mode_last_used_filters_by_mode_name_exactly(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Filter is `=` not `LIKE` — ``coding`` does not match ``coding-v2`` or ``code``."""
+    # Seed three sessions with similar-but-distinct mode names.
+    await engine.execute(
+        "INSERT INTO sessions (started_at, ended_at, mode_name, seed_text, summary, is_complete) "
+        "VALUES (?, NULL, 'code', NULL, NULL, 0)",
+        ("2026-04-20T09:00:00+00:00",),
+    )
+    await engine.execute(
+        "INSERT INTO sessions (started_at, ended_at, mode_name, seed_text, summary, is_complete) "
+        "VALUES (?, NULL, 'coding', NULL, NULL, 0)",
+        ("2026-04-20T10:00:00+00:00",),
+    )
+    await engine.execute(
+        "INSERT INTO sessions (started_at, ended_at, mode_name, seed_text, summary, is_complete) "
+        "VALUES (?, NULL, 'coding-v2', NULL, NULL, 0)",
+        ("2026-04-20T11:00:00+00:00",),
+    )
+
+    assert await adapter.get_mode_last_used("coding") == "2026-04-20T10:00:00+00:00"
+    assert await adapter.get_mode_last_used("code") == "2026-04-20T09:00:00+00:00"
+    assert await adapter.get_mode_last_used("coding-v2") == "2026-04-20T11:00:00+00:00"
+
+
+async def test_get_mode_last_used_skips_sessions_with_null_mode_name(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Setup-row shape (mode_name=NULL) never matches any stem query.
+
+    Locks Story 2.4 compatibility: the setup session has mode_name=NULL,
+    and SQL `WHERE mode_name = 'coding'` with NULL on the left returns
+    UNKNOWN (filtered out). Stem queries therefore look past the setup
+    row to any real session with a populated mode_name.
+    """
+    # Row 1: setup-row shape (mode_name NULL), started earlier.
+    await engine.execute(
+        "INSERT INTO sessions (started_at, ended_at, mode_name, seed_text, summary, is_complete) "
+        "VALUES (?, ?, NULL, NULL, NULL, 1)",
+        ("2026-04-20T09:00:00+00:00", "2026-04-20T09:00:02+00:00"),
+    )
+    # Row 2: real runtime session with mode_name populated, started later.
+    await engine.execute(
+        "INSERT INTO sessions (started_at, ended_at, mode_name, seed_text, summary, is_complete) "
+        "VALUES (?, NULL, 'coding', NULL, NULL, 0)",
+        ("2026-04-21T10:00:00+00:00",),
+    )
+
+    assert await adapter.get_mode_last_used("coding") == "2026-04-21T10:00:00+00:00"
+
+
+async def test_get_mode_last_used_is_idempotent_on_reread(
+    adapter: SqliteBrainAdapter,
+) -> None:
+    """Repeated reads against the same row return byte-identical strings."""
+    await adapter.create_session(mode_name="coding", started_at="2026-04-21T10:00:00+00:00")
+
+    first = await adapter.get_mode_last_used("coding")
+    second = await adapter.get_mode_last_used("coding")
+    third = await adapter.get_mode_last_used("coding")
+    assert first == second == third == "2026-04-21T10:00:00+00:00"
+
+
+async def test_get_mode_last_used_returns_none_for_empty_string_mode_name(
+    adapter: SqliteBrainAdapter,
+) -> None:
+    """Empty ``mode_name`` input returns ``None`` (docstring contract).
+
+    No session carries an empty string as ``mode_name`` — setup writes
+    ``NULL`` and runtime writes populated stems. An empty-string argument
+    therefore matches no rows and the method returns ``None`` rather than
+    raising. Locking this lets future drift in upstream writers
+    (introducing an empty-string stem somewhere) surface as a failing
+    test at this boundary instead of mysteriously succeeding.
+    """
+    # Seed a populated session so the query runs against real data and
+    # only the empty-string filter returns no match.
+    await adapter.create_session(mode_name="coding", started_at="2026-04-21T10:00:00+00:00")
+
+    assert await adapter.get_mode_last_used("") is None
