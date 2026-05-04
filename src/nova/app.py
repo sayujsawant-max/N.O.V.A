@@ -43,6 +43,9 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from rich.console import Console
+
+from nova.adapters.rich import RichSkinAdapter
 from nova.adapters.shield import NoOpShieldAdapter
 from nova.adapters.sqlite.brain import SqliteBrainAdapter
 from nova.core import (
@@ -55,6 +58,9 @@ from nova.core import (
 )
 from nova.ports import ShieldPort
 from nova.ports.brain import BrainPort
+from nova.ports.ritual import RitualPort
+from nova.ports.skin import SkinPort
+from nova.systems.ritual import RitualSystem
 
 logger = logging.getLogger("nova.app")
 
@@ -96,6 +102,8 @@ class NovaApp:
     audit: AuditLogger
     tier_manager: TierManager
     shield: ShieldPort
+    ritual: RitualPort
+    skin: SkinPort
     close: Callable[[], Awaitable[None]] = field(repr=False)
 
 
@@ -190,6 +198,16 @@ async def create_app(
             extra={"adapter": type(shield_adapter).__name__},
         )
 
+        # Story 3.3 — Ritual system + Rich skin adapter. Both are stateless
+        # (Ritual is parameterless, RichSkinAdapter holds one Console
+        # reference); neither acquires external resources, so the existing
+        # partial-init cleanup block already covers them.
+        ritual: RitualPort = RitualSystem()
+        logger.info("ritual system wired", extra={"system": type(ritual).__name__})
+
+        skin: SkinPort = RichSkinAdapter(console=Console())
+        logger.info("skin adapter wired", extra={"adapter": type(skin).__name__})
+
         async def _close() -> None:
             await storage.close()
             logger.info("storage engine closed")
@@ -202,6 +220,8 @@ async def create_app(
             audit=audit,
             tier_manager=tier_manager,
             shield=shield_adapter,
+            ritual=ritual,
+            skin=skin,
             close=_close,
         )
     except BaseException:

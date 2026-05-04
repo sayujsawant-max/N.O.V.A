@@ -83,6 +83,12 @@ def _render_state_a(console: Console) -> None:
     tagline or "Running setup..." preface widens the contract and is
     explicitly rejected by the Story 2.4 test
     ``test_state_a_body_contains_first_session_line``.
+
+    Title is constructed via :class:`rich.text.Text` (NOT via
+    Rich-markup-string concatenation) — matches the bare-``nova``-boot
+    renderer at :class:`~nova.adapters.rich.skin.RichSkinAdapter` so
+    the byte-for-byte parity test (Story 3.3 AC #20 ANSI variant)
+    holds across both code paths.
     """
     body = Text()
     body.append(
@@ -97,7 +103,7 @@ def _render_state_a(console: Console) -> None:
 
     panel = Panel(
         body,
-        title="[bold cyan]N.O.V.A.[/bold cyan]",
+        title=Text("N.O.V.A.", style="bold cyan"),
         border_style="cyan",
         padding=(1, 2),
     )

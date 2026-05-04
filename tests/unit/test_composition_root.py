@@ -294,16 +294,35 @@ def _is_inside_function_or_class(node: ast.AST) -> bool:
 
 
 def test_sqlite_brain_adapter_is_instantiated_inside_create_app() -> None:
-    """Story 3.1 AC #23 — positive-case AST assertion complementing
-    ``test_app_module_level_has_no_adapter_instantiation``.
+    """Story 3.1 AC #23 — wiring lock; see :func:`_assert_class_instantiated_inside_create_app`."""
+    _assert_class_instantiated_inside_create_app(
+        "SqliteBrainAdapter",
+        "Story 3.1 AC #23 requires the Brain adapter to be wired in the composition root.",
+    )
 
-    The module-scope test above catches the negative case (no adapter
-    instantiation outside a function). This test pins the positive case:
-    the ``SqliteBrainAdapter(...)`` call must appear SOMEWHERE inside
-    ``create_app``'s body, so a silent deletion of the wiring (adapter
-    never constructed, ``NovaApp.brain`` would be left unassigned or
-    wired to a stub) cannot slip past CI.
+
+def test_ritual_system_is_instantiated_inside_create_app() -> None:
+    """Story 3.3 AC #19 — positive-case AST assertion for ``RitualSystem``.
+
+    Catches a silent-deletion regression where the wiring is removed
+    and ``NovaApp.ritual`` is left unassigned at the type-checker level.
     """
+    _assert_class_instantiated_inside_create_app(
+        "RitualSystem",
+        "Story 3.3 AC #19 requires RitualSystem to be wired in the composition root.",
+    )
+
+
+def test_rich_skin_adapter_is_instantiated_inside_create_app() -> None:
+    """Story 3.3 AC #19 — positive-case AST assertion for ``RichSkinAdapter``."""
+    _assert_class_instantiated_inside_create_app(
+        "RichSkinAdapter",
+        "Story 3.3 AC #19 requires RichSkinAdapter to be wired in the composition root.",
+    )
+
+
+def _assert_class_instantiated_inside_create_app(class_name: str, requirement: str) -> None:
+    """Walk ``create_app``'s AST and assert at least one ``ClassName(...)`` call."""
     app_path = NOVA_SRC_ROOT / "app.py"
     tree = ast.parse(app_path.read_text(encoding="utf-8"))
 
@@ -319,19 +338,18 @@ def test_sqlite_brain_adapter_is_instantiated_inside_create_app() -> None:
         if not isinstance(inner, ast.Call):
             continue
         callee = inner.func
-        if isinstance(callee, ast.Name) and callee.id == "SqliteBrainAdapter":
+        if isinstance(callee, ast.Name) and callee.id == class_name:
             instantiations.append(ast.unparse(inner))
-    assert instantiations, (
-        "create_app must instantiate SqliteBrainAdapter; none found. "
-        "Story 3.1 AC #23 requires the Brain adapter to be wired in the composition root."
-    )
+    assert instantiations, f"create_app must instantiate {class_name}; none found. {requirement}"
 
 
 # --- AC #8 tests ------------------------------------------------------------
 
 # Allowlist of logger-name-depth exceptions. The storage sublayer (Story
 # 1.4 / 1.5) uses a three-dot name that predates the two-dot convention;
-# any future exception requires a story-level convention amendment.
+# concrete adapters under ``adapters/{driver}/{system}`` follow the same
+# ``nova.adapters.{driver}.{system}`` shape. Any future exception requires
+# a story-level convention amendment.
 _LOGGER_NAME_DEPTH_ALLOWLIST: frozenset[str] = frozenset(
     {
         "nova.core.storage.engine",
@@ -341,6 +359,10 @@ _LOGGER_NAME_DEPTH_ALLOWLIST: frozenset[str] = frozenset(
         # drivers (e.g. a Postgres Brain adapter in T2) follow the same
         # ``nova.adapters.{driver}.{system}`` logger-name shape.
         "nova.adapters.sqlite.brain",
+        # Story 3.3 — Rich-backed Skin adapter follows the same nested
+        # shape (``adapters/{driver}/{system}``) as the SQLite Brain
+        # adapter.
+        "nova.adapters.rich.skin",
     }
 )
 

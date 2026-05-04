@@ -37,7 +37,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-14
-last_updated: 2026-05-04 (Story 3.2 fully done: 10 code-review patches applied, ruff + mypy + pytest all green locally. Final tally: 1377 of 1378 tests pass (1373 in default-capture pass + 4 setup_bat tests with -s). The 1 skipped is a pre-existing skip; zero failures. SAC permanently turned Off (Win11 Home one-way door). Diagnosed test_setup_bat.py pipe-deadlock root cause (pytest default capture × Windows subprocess handle inheritance) — workaround logged in deferred-work.md for a Story 2.1 follow-up. Status: review → done.)
+last_updated: 2026-05-04 (Story 3.3 fully done: review → done. 22 code-review patches applied (3 decision-needed resolved: warn-on-FIRST_RUN-violation, brittle-marker for ANSI parity test, comma-escape in label builders). pyproject.toml gained `brittle` marker + `addopts = -m not brittle` so the ANSI test deselects by default; opt in with `pytest -m brittle`. setup._render_state_a updated symmetrically to use Text-based title (matches the markup-injection-safe pattern P2 introduced). 7 review items deferred to deferred-work.md (timezone-mixed lexicographic sort, fractional-second precision, comma in app_name from Eyes layer, newline in display_name from config validation, corrupt-row 0s indistinguishability, dedup test absence, degenerate State C UX). 12 review items dismissed as per-spec / over-impl / acknowledged. Final tally: 1438 unit pass + 1 brittle deselected + 1 pre-existing skip + 51 integration pass; 100% coverage on Story 3.3 modules (157 stmts + 60 branches, 0 misses). ruff + mypy strict + ruff-format all clean.)
 project: AI Assistant
 project_key: NOKEY
 tracking_system: file-system
@@ -73,7 +73,7 @@ development_status:
   epic-3: in-progress
   3-1-brain-session-and-seed-persistence: done
   3-2-briefingaggregate-and-state-determination: done
-  3-3-briefingviewmodel-and-briefing-card-rendering: backlog
+  3-3-briefingviewmodel-and-briefing-card-rendering: done
   3-4-t1-command-grammar-and-deterministic-parser: backlog
   3-5-nerve-command-routing-and-session-lifecycle: backlog
   3-6-mode-restore-and-app-launching: backlog

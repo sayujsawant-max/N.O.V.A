@@ -65,13 +65,20 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = ["--strict-markers"]
+# `brittle` tests are deselected by default — opt in with `-m brittle` or
+# the deselect can be lifted via `--no-skip-brittle` (see tests/conftest.py).
+# Ships with Story 3.3 to gate the ANSI byte-stream parity test that drifts
+# under Rich version upgrades; never silence a failure by removing the
+# marker — investigate, decide whether to update the snapshot or fix the
+# renderer.
+addopts = ["--strict-markers", "-m", "not brittle"]
 markers = [
     "unit: unit tests - isolated, no external dependencies",
     "integration: integration tests - real SQLite, mock external services",
     "e2e: end-to-end tests through the continuity loop",
     "windows_only: tests that require Windows APIs",
     "migration: schema migration tests",
+    "brittle: tests that lock implementation details (e.g. Rich ANSI byte streams) and may flake on dependency upgrades — deselected by default, run with `-m brittle` after a Rich/terminal-stack change",
 ]
 
 [tool.coverage.run]

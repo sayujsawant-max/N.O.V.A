@@ -60,6 +60,12 @@ async def test_create_app_returns_populated_novaapp(tmp_path: Path) -> None:
         assert isinstance(app.audit, AuditLogger)
         assert isinstance(app.tier_manager, TierManager)
         assert isinstance(app.shield, NoOpShieldAdapter)
+        # Story 3.3 — Ritual + Skin wiring
+        from nova.adapters.rich import RichSkinAdapter
+        from nova.systems.ritual import RitualSystem
+
+        assert isinstance(app.ritual, RitualSystem)
+        assert isinstance(app.skin, RichSkinAdapter)
         assert callable(app.close)
         assert app.tier_manager.tier is CapabilityTier.FULL
     finally:
@@ -294,6 +300,52 @@ async def test_create_app_teardown_logs_secondary_close_failure(
     assert close_call_count["n"] == 1
     # Secondary failure is logged, not swallowed silently.
     assert any("secondary error" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("exc_class", "exc_msg"),
+    [
+        pytest.param(RuntimeError, "ritual boom", id="runtime_error"),
+        # The composition root catches ``BaseException`` specifically so
+        # cleanup runs on KeyboardInterrupt mid-init. A future regression
+        # narrowing the except clause to ``Exception`` would leak the
+        # engine on Ctrl-C; this parametrize entry guards against that
+        # (review finding P18).
+        pytest.param(KeyboardInterrupt, "interrupted", id="keyboard_interrupt"),
+    ],
+)
+async def test_create_app_closes_engine_if_ritual_system_init_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exc_class: type[BaseException],
+    exc_msg: str,
+) -> None:
+    """Story 3.3 AC #31 — partial-init cleanup covers the new ritual wiring.
+
+    Parametrized over both ``RuntimeError`` and ``KeyboardInterrupt`` to
+    lock the ``except BaseException`` semantics — a regression that
+    narrows to ``except Exception`` would leak the engine on Ctrl-C.
+    """
+    close_calls: list[str] = []
+    original_close = SqliteStorageEngine.close
+
+    async def tracked_close(self: SqliteStorageEngine) -> None:
+        close_calls.append("close")
+        await original_close(self)
+
+    captured_exc = exc_class
+
+    def failing_init(self: object) -> None:
+        del self
+        raise captured_exc(exc_msg)
+
+    monkeypatch.setattr(SqliteStorageEngine, "close", tracked_close)
+    monkeypatch.setattr("nova.app.RitualSystem.__init__", failing_init)
+
+    config = _build_config(tmp_path)
+    with pytest.raises(exc_class, match=exc_msg):
+        await create_app(config)
+    assert close_calls == ["close"]
 
 
 async def test_close_tears_down_engine(tmp_path: Path) -> None:
