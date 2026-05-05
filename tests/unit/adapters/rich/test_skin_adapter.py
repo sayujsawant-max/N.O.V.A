@@ -665,3 +665,44 @@ async def test_renderer_skips_empty_string_intro_lines() -> None:
         f"empty-string intro entry leaked a blank line between the two "
         f"non-empty entries (indices {idx_one}, {idx_two})"
     )
+
+
+# --- parse_command delegation tests (Story 3.4 AC #14) ---------------------
+
+
+async def test_parse_command_delegates_to_pure_parser() -> None:
+    """``RichSkinAdapter.parse_command`` returns the same Command the
+    pure parser produces — locks delegation, not vocabulary (the
+    parser tests cover the matrix).
+    """
+    from nova.systems.skin.models import CommandVerb
+
+    adapter = RichSkinAdapter(console=_build_console())
+    result = await adapter.parse_command("mode coding")
+    assert result.verb is CommandVerb.MODE
+    assert result.target == "coding"
+    assert result.raw_input == "mode coding"
+    assert result.is_contextual is False
+
+
+async def test_parse_command_handles_empty_input() -> None:
+    """Empty input through the adapter still produces ``CommandVerb.EMPTY``."""
+    from nova.systems.skin.models import CommandVerb
+
+    adapter = RichSkinAdapter(console=_build_console())
+    result = await adapter.parse_command("")
+    assert result.verb is CommandVerb.EMPTY
+    assert result.target is None
+    assert result.raw_input == ""
+    assert result.is_contextual is False
+
+
+def test_parse_command_is_async_at_skinport_boundary() -> None:
+    """Companion lock to ``test_parse_is_sync_function`` in
+    ``test_command_shape.py``: the SkinPort surface is async, the
+    pure parser underneath is sync, and ``RichSkinAdapter.parse_command``
+    bridges them.
+    """
+    import inspect
+
+    assert inspect.iscoroutinefunction(RichSkinAdapter.parse_command) is True

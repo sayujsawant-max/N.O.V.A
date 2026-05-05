@@ -17,6 +17,8 @@ Allowed import surface (Story 3.3 AC #29):
   ``SkinPort.render_progress``).
 * ``nova.systems.ritual.models`` — ``BriefingViewModel`` (input type
   for ``render_briefing_card``).
+* ``nova.systems.skin.commands`` — ``parse`` function the adapter
+  delegates to from ``parse_command`` (Story 3.4).
 * ``nova.systems.skin.models`` — ``Command`` (declared in
   ``SkinPort.parse_command``).
 
@@ -78,6 +80,7 @@ ALLOWED_SYSTEMS_MODELS: frozenset[str] = frozenset(
         "nova.systems.brain.models",
         "nova.systems.hands.models",
         "nova.systems.ritual.models",
+        "nova.systems.skin.commands",
         "nova.systems.skin.models",
     }
 )
@@ -204,6 +207,7 @@ def test_rich_skin_only_imports_pinned_rich_submodules() -> None:
         "nova.systems.brain.models",
         "nova.systems.hands.models",
         "nova.systems.ritual.models",
+        "nova.systems.skin.commands",
         "nova.systems.skin.models",
     ],
 )

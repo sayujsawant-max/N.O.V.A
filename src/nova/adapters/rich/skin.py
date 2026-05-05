@@ -4,9 +4,10 @@ Architecture (architecture.md:1377):
 ``adapters/rich/skin.py — RichSkinAdapter — Panel, Table, Tree, Progress
 rendering``. Story 3.3 ships only :meth:`render_briefing_card` (the
 Briefing Card Panel surface). Tree (transparency, Epic 5) and Progress
-(mode restore, Story 3.6) land in their epics. Command parsing
-(Story 3.4) and the shutdown / response / input methods (Story 3.7)
-land in their respective stories.
+(mode restore, Story 3.6) land in their epics. Command parsing lands
+here via delegation to :func:`nova.systems.skin.commands.parse`; the
+shutdown / response / input methods (Story 3.7) land in their
+respective stories.
 
 Port-trapping invariant (project-context.md §62):
 Rich-specific types (:class:`rich.panel.Panel`, :class:`rich.text.Text`,
@@ -56,6 +57,7 @@ from rich.text import Text
 from nova.systems.brain.models import SessionSummary
 from nova.systems.hands.models import ActionResult
 from nova.systems.ritual.models import BriefingViewModel
+from nova.systems.skin.commands import parse
 from nova.systems.skin.models import Command
 
 
@@ -145,7 +147,7 @@ class RichSkinAdapter:
         raise NotImplementedError("Story 3.7 scope")
 
     async def parse_command(self, raw_input: str) -> Command:
-        raise NotImplementedError("Story 3.4 scope")
+        return parse(raw_input)
 
 
 __all__: list[str] = ["RichSkinAdapter"]

@@ -37,7 +37,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-14
-last_updated: 2026-05-04 (Story 3.3 fully done: review → done. 22 code-review patches applied (3 decision-needed resolved: warn-on-FIRST_RUN-violation, brittle-marker for ANSI parity test, comma-escape in label builders). pyproject.toml gained `brittle` marker + `addopts = -m not brittle` so the ANSI test deselects by default; opt in with `pytest -m brittle`. setup._render_state_a updated symmetrically to use Text-based title (matches the markup-injection-safe pattern P2 introduced). 7 review items deferred to deferred-work.md (timezone-mixed lexicographic sort, fractional-second precision, comma in app_name from Eyes layer, newline in display_name from config validation, corrupt-row 0s indistinguishability, dedup test absence, degenerate State C UX). 12 review items dismissed as per-spec / over-impl / acknowledged. Final tally: 1438 unit pass + 1 brittle deselected + 1 pre-existing skip + 51 integration pass; 100% coverage on Story 3.3 modules (157 stmts + 60 branches, 0 misses). ruff + mypy strict + ruff-format all clean.)
+last_updated: 2026-05-05 (Story 3.4 done with post-review corrections. Three-layer adversarial review (Blind Hunter / Edge Case Hunter / Acceptance Auditor) ran in fresh agent contexts: 48 raw findings, 19 unique. 3 decisions resolved + 12 patches applied + 3 deferred + ~25 dismissed. **Two post-review user-reported corrections:** (1) D1 reverted — UX spec table lists `modes` as alias for *List modes* only (canonical: bare `mode`); Switch mode has no alias. `modes coding` therefore drops trailing tokens like `status mode` / `help foo`, NOT mode-switch as D1 (b) initially had it. `modes` moved from `_SPECIAL_DISPATCH_FIRST_TOKENS` to `_BARE_VERB_ALIAS`. (2) "Detected conflicts" entry rewrote — incorrectly claimed `nova mode coding` and in-session `mode coding` produce the same Command, but parser actually maps `nova mode coding` to UNKNOWN (Block 10 lock). Now states parser sees only post-shell-prefix-strip text; cli.py argparse is Story 3.5 territory. Final tally: 1607 unit pass (+169 over Story 3.3 baseline) + 1 brittle deselected + 1 pre-existing skip + 51 integration pass; 100% coverage on Story 3.4 modules (112 stmts + 44 branches, 0 misses). ruff + mypy strict + ruff-format all clean.)
 project: AI Assistant
 project_key: NOKEY
 tracking_system: file-system
@@ -74,7 +74,7 @@ development_status:
   3-1-brain-session-and-seed-persistence: done
   3-2-briefingaggregate-and-state-determination: done
   3-3-briefingviewmodel-and-briefing-card-rendering: done
-  3-4-t1-command-grammar-and-deterministic-parser: backlog
+  3-4-t1-command-grammar-and-deterministic-parser: done
   3-5-nerve-command-routing-and-session-lifecycle: backlog
   3-6-mode-restore-and-app-launching: backlog
   3-7-shutdown-flow-and-seed-capture: backlog
