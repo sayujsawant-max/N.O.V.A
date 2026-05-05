@@ -26,7 +26,7 @@ from nova.adapters.rich.skin import RichSkinAdapter
 from nova.core.types import ActionType, BriefingState, CapabilityTier
 from nova.systems.brain.models import ModeInfo
 from nova.systems.hands.models import ActionResult
-from nova.systems.ritual.models import BriefingViewModel
+from nova.systems.ritual.models import BriefingViewModel, ShutdownViewModel
 
 # --- Fixture builders --------------------------------------------------------
 
@@ -942,3 +942,109 @@ async def test_render_progress_uses_markup_false() -> None:
 
     mock_console.print.assert_called_once()
     assert mock_console.print.call_args.kwargs.get("markup") is False
+
+
+# ===========================================================================
+# Story 3.7 — render_shutdown_card
+# ===========================================================================
+
+
+def _shutdown_view_model(
+    *,
+    mode_label: str | None = "Mode: Coding",
+    duration_label: str = "Duration: 1h 23m",
+    apps_label: str | None = "Apps: VS Code, Postman",
+) -> ShutdownViewModel:
+    return ShutdownViewModel(
+        session_id=42,
+        title="Session ending",
+        mode_label=mode_label,
+        duration_label=duration_label,
+        apps_label=apps_label,
+        prompt_text="What should you pick up tomorrow?",
+    )
+
+
+@pytest.mark.asyncio
+async def test_render_shutdown_card_emits_panel_with_yellow_border_and_title() -> None:
+    """Yellow border distinguishes shutdown from briefing's cyan.
+
+    Locks both the border style AND the title style — the title is
+    rendered via ``Text(view_model.title, style="bold yellow")`` so a
+    regression that drops the title styling (or accidentally pulls the
+    cyan briefing color) is caught here, not at runtime.
+    """
+    from unittest.mock import MagicMock
+
+    from rich.panel import Panel
+    from rich.text import Text
+
+    mock_console = MagicMock(spec=Console)
+    adapter = RichSkinAdapter(console=mock_console)
+    await adapter.render_shutdown_card(_shutdown_view_model())
+    mock_console.print.assert_called_once()
+    panel = mock_console.print.call_args.args[0]
+    assert isinstance(panel, Panel)
+    assert panel.border_style == "yellow"
+    assert isinstance(panel.title, Text)
+    # The title's style is set via the Text constructor; export the
+    # spans to verify the "bold yellow" style is applied to the
+    # entire title text.
+    assert panel.title.style == "bold yellow"
+
+
+@pytest.mark.asyncio
+async def test_render_shutdown_card_renders_mode_duration_apps_and_prompt() -> None:
+    console = _build_console()
+    adapter = RichSkinAdapter(console=console)
+    await adapter.render_shutdown_card(_shutdown_view_model())
+    output = console.export_text()
+    assert "Mode: Coding" in output
+    assert "Duration: 1h 23m" in output
+    assert "Apps: VS Code, Postman" in output
+    assert "What should you pick up tomorrow?" in output
+    assert "Session ending" in output  # title
+
+
+@pytest.mark.asyncio
+async def test_render_shutdown_card_omits_mode_label_when_none() -> None:
+    console = _build_console()
+    adapter = RichSkinAdapter(console=console)
+    await adapter.render_shutdown_card(_shutdown_view_model(mode_label=None))
+    output = console.export_text()
+    assert "Mode:" not in output
+    # Other lines still render
+    assert "Duration: 1h 23m" in output
+
+
+@pytest.mark.asyncio
+async def test_render_shutdown_card_omits_apps_label_when_none() -> None:
+    console = _build_console()
+    adapter = RichSkinAdapter(console=console)
+    await adapter.render_shutdown_card(_shutdown_view_model(apps_label=None))
+    output = console.export_text()
+    assert "Apps:" not in output
+    assert "Duration: 1h 23m" in output
+
+
+@pytest.mark.asyncio
+async def test_render_shutdown_card_duration_label_always_present() -> None:
+    console = _build_console()
+    adapter = RichSkinAdapter(console=console)
+    await adapter.render_shutdown_card(_shutdown_view_model(mode_label=None, apps_label=None))
+    output = console.export_text()
+    assert "Duration: 1h 23m" in output
+
+
+@pytest.mark.asyncio
+async def test_render_shutdown_card_does_not_interpret_markup_in_mode_name() -> None:
+    """Markup-injection-safe — Text.append is used, NOT raw markup-string concat."""
+    console = _build_console()
+    adapter = RichSkinAdapter(console=console)
+    # A user-controlled mode label with Rich-markup-looking brackets should
+    # render literally — the Text.append path doesn't interpret markup.
+    vm = _shutdown_view_model(mode_label="Mode: [bold red]Coding[/]")
+    await adapter.render_shutdown_card(vm)
+    output = console.export_text()
+    # Literal brackets in output (NOT applied as markup).
+    assert "[bold red]Coding[/]" in output

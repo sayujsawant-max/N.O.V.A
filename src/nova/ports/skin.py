@@ -19,6 +19,16 @@ The Sequence form was speculative (Story 1.9 stub); single-result is
 what the epic AC requires (``✓ VS Code`` / ``✗ Postman`` lines render
 as each launch lands).
 
+Story 3.7 reshapes :meth:`render_shutdown_card` from
+``SessionSummary -> None`` to ``ShutdownViewModel -> None``. The
+``SessionSummary`` typing was a Story 1.9 stub assumption;
+``SessionSummary`` is the Brain-projection (carries ``is_complete``,
+raw ``duration_seconds``, etc.) and lacks the active-mode display
+label, the apps-used tuple, the formatted duration string, and the
+prompt text. The pre-rendered-labels pattern from Story 3.3 is the
+right shape — ``ShutdownViewModel`` has every visible string already
+formatted; Skin only chooses the Rich style.
+
 Port rules (architecture.md:948-986, 1464):
 
 - :class:`SkinPort` is a :class:`typing.Protocol` (structural subtyping).
@@ -33,9 +43,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from nova.systems.brain.models import SessionSummary
 from nova.systems.hands.models import ActionResult
-from nova.systems.ritual.models import BriefingViewModel
+from nova.systems.ritual.models import BriefingViewModel, ShutdownViewModel
 from nova.systems.skin.models import Command
 
 
@@ -46,7 +55,7 @@ class SkinPort(Protocol):
 
     async def render_progress(self, result: ActionResult) -> None: ...
 
-    async def render_shutdown_card(self, summary: SessionSummary) -> None: ...
+    async def render_shutdown_card(self, view_model: ShutdownViewModel) -> None: ...
 
     async def render_response(self, text: str) -> None: ...
 

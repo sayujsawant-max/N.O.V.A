@@ -121,21 +121,55 @@ class BriefingViewModel:
 
 
 @dataclass(frozen=True)
-class ShutdownData:
-    """Opening payload of the shutdown flow, returned by ``RitualPort.begin_shutdown``.
+class ShutdownState:
+    """Runtime input to ``RitualPort.begin_shutdown`` (Story 3.7).
 
-    ``prompt_text`` is the Voice-generated (or tier-degraded structured)
-    seed prompt. ``last_context`` is an opaque summary of what the user
-    was working on — ``None`` if the session never accumulated context
-    (e.g., first-run session exiting immediately after setup).
+    Carries the Nerve-side runtime fields Ritual needs to render the
+    shutdown card. ``apps_used`` is the
+    ``_active_mode_apps_launched`` tuple — display names of apps
+    successfully launched by the LAST successful mode-restore (NOT
+    cumulative across mode switches; T1 simplicity).
+
+    ``active_mode_display_name`` is resolved by Nerve via
+    ``config.modes[active_mode_stem].name`` so Ritual stays
+    config-blind (mirrors the briefing pattern where Nerve does the
+    config lookup). When ``active_mode_stem`` is None the display
+    name is also None — the shutdown card omits the Mode line.
     """
 
     session_id: int
+    started_at: str
+    ended_at: str
+    active_mode_stem: str | None
+    active_mode_display_name: str | None
+    apps_used: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ShutdownViewModel:
+    """Render-ready shutdown card output consumed by ``SkinPort.render_shutdown_card``.
+
+    Pre-rendered labels per the Story 3.3 briefing precedent — every
+    visible string originates here, Skin only chooses the Rich
+    style. Progressive omission: ``None`` fields are omitted by
+    Skin (no empty placeholders, no "N/A").
+
+    ``prompt_text`` is the seed-capture question. T1 ships locked
+    copy ("What should you pick up tomorrow?"); Voice (Epic 7) will
+    replace with personality-bearing text — the field shape is
+    forward-compatible.
+    """
+
+    session_id: int
+    title: str
+    mode_label: str | None
+    duration_label: str
+    apps_label: str | None
     prompt_text: str
-    last_context: str | None
 
 
 __all__: list[str] = [
     "BriefingViewModel",
-    "ShutdownData",
+    "ShutdownState",
+    "ShutdownViewModel",
 ]

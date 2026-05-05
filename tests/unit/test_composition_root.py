@@ -387,6 +387,44 @@ def test_nerve_system_call_passes_hands_kwarg() -> None:
     )
 
 
+def test_nerve_system_call_passes_audit_kwarg() -> None:
+    """Story 3.7 — ``NerveSystem(...)`` in create_app receives an ``audit=`` kwarg.
+
+    Mirrors the Story 3.6 ``hands=`` AST guard. ``self._audit`` is the
+    ``AuditLogger`` reference Nerve uses for the SEED_CAPTURE audit row
+    in :meth:`_handle_shutdown` (Story 3.7 Group A AC #1 step 8).
+    Without this kwarg the constructor raises ``TypeError`` at
+    composition-root time; the AST guard surfaces the missing wire
+    earlier in the test pipeline than the runtime failure would.
+    """
+    app_path = NOVA_SRC_ROOT / "app.py"
+    tree = ast.parse(app_path.read_text(encoding="utf-8"))
+
+    create_app_fn: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "create_app":
+            create_app_fn = node
+            break
+    assert create_app_fn is not None
+
+    nerve_call: ast.Call | None = None
+    for inner in ast.walk(create_app_fn):
+        if (
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "NerveSystem"
+        ):
+            nerve_call = inner
+            break
+    assert nerve_call is not None, "create_app must instantiate NerveSystem"
+
+    kwarg_names = {kw.arg for kw in nerve_call.keywords if kw.arg is not None}
+    assert "audit" in kwarg_names, (
+        f"NerveSystem(...) call in create_app must include audit= kwarg "
+        f"(Story 3.7 reshape); got kwargs: {sorted(kwarg_names)}."
+    )
+
+
 def _assert_class_instantiated_inside_create_app(class_name: str, requirement: str) -> None:
     """Walk ``create_app``'s AST and assert at least one ``ClassName(...)`` call."""
     app_path = NOVA_SRC_ROOT / "app.py"

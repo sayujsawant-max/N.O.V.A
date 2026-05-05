@@ -54,13 +54,34 @@ Design invariants
   ``False``. Story 4.3 will unify the richer-capture shape with the
   persisted shape.
 
-Scope fence (Story 3.1)
------------------------
+Story 3.7 additions
+-------------------
+* ``commit_shutdown`` — atomic three-write shutdown finalization.
+  Wraps the ``sessions`` UPDATE + ``memory_items`` INSERT (when seed
+  entered) + ``workspace_snapshots`` INSERT in a single
+  ``engine.transaction()`` block. The adapter is the single source
+  of truth for ``ended_at`` / ``created_at`` / ``captured_at``
+  cross-row consistency — caller-supplied timestamps would create
+  drift; ``ShutdownCommit`` carries no timestamp fields. Full
+  idempotency: a pre-write SELECT inside the transaction branches
+  on the session's current state — missing row raises
+  ``StorageError``; already-complete row returns the existing
+  ``ended_at`` and SKIPS all three writes (no duplicate seed memory
+  rows or duplicate shutdown snapshots); incomplete row proceeds
+  with the three-write commit.
+* ``end_session`` gains a defensive idempotency guard (``WHERE
+  is_complete = 0``) so a re-call on an already-completed session
+  is a clean no-op. Closes deferred-work.md:231.
+
+Scope fence (Story 3.1 / 3.7)
+-----------------------------
 Epic 5 methods (``query_memory``, ``delete_matching``,
 ``confirm_deletion``, ``get_transparency_model``) raise
-``NotImplementedError("Epic 5 scope")``. Memory-item writes
-(``create_memory_item`` etc.) are NOT on the port yet — Story 3.7
-(shutdown seed capture) and Epic 4 / 5 own those extensions.
+``NotImplementedError("Epic 5 scope")``. Memory-item writes are
+encapsulated INSIDE Story 3.7's ``commit_shutdown`` transaction;
+a standalone ``add_memory_item`` write surface is Epic 4 / 5 scope
+when their use cases (session notes, context summaries, pattern
+memory) need a non-transactional write path.
 """
 
 from __future__ import annotations
@@ -72,12 +93,13 @@ from datetime import datetime
 from nova.core import events
 from nova.core.exceptions import StorageError
 from nova.core.storage.engine import SqliteStorageEngine
-from nova.core.types import SnapshotType
+from nova.core.types import MemoryCategory, SnapshotType
 from nova.systems.brain.models import (
     DeletionPreview,
     DeletionResult,
     MemoryItem,
     SessionSummary,
+    ShutdownCommit,
     TransparencyModel,
     WorkspaceSnapshotInput,
 )
@@ -95,7 +117,39 @@ VALUES (?, NULL, ?, NULL, NULL, 0)
 _UPDATE_SESSION_END_SQL = """
 UPDATE sessions
    SET ended_at = ?, seed_text = ?, summary = ?, is_complete = ?
- WHERE id = ?
+ WHERE id = ? AND is_complete = 0
+"""
+
+# Story 3.7 — commit_shutdown's session UPDATE always finalizes
+# (is_complete=1). Filter on is_complete=0 is defense-in-depth; the
+# explicit pre-write SELECT in commit_shutdown short-circuits the
+# already-completed branch BEFORE this UPDATE runs, so the filter
+# only fires under a hypothetical race the transaction's lock
+# prevents in practice.
+#
+# ``mode_name`` is also written so that ``get_mode_last_used(stem)``
+# (Story 3.2) — which queries ``sessions.mode_name`` — can find the
+# session in next-startup briefing assembly. ``startup()`` creates
+# the session with ``mode_name=None``; mode switches during the
+# session don't update the column (see "Why _active_mode_name lives
+# on NerveSystem, not in Brain" Dev Note in 3-6 spec). Shutdown is
+# the natural durable boundary where the active mode lands in the
+# row — closes the gap between "user used coding mode all session"
+# and "next session's State C briefing knows coding was used."
+_UPDATE_SESSION_COMMIT_SHUTDOWN_SQL = """
+UPDATE sessions
+   SET ended_at = ?, seed_text = ?, summary = ?, mode_name = ?, is_complete = 1
+ WHERE id = ? AND is_complete = 0
+"""
+
+_INSERT_MEMORY_ITEM_SHUTDOWN_SQL = """
+INSERT INTO memory_items (session_id, category, content, created_at)
+VALUES (?, ?, ?, ?)
+"""
+
+_INSERT_SHUTDOWN_SNAPSHOT_SQL = """
+INSERT INTO workspace_snapshots (session_id, captured_at, snapshot_type, workspace_data)
+VALUES (?, ?, ?, ?)
 """
 
 _SELECT_LAST_SESSION_SQL = """
@@ -169,8 +223,13 @@ def _compute_duration_seconds(started_at: str, ended_at: str | None) -> int:
     return int(delta)
 
 
-def _serialize_snapshot(snapshot: WorkspaceSnapshotInput) -> str:
-    """Serialize a :class:`WorkspaceSnapshotInput` to the locked JSON shape.
+def _serialize_workspace_data(
+    *,
+    apps: tuple[str, ...],
+    focused_app: str | None,
+    mode_name: str | None,
+) -> str:
+    """Serialize the three workspace-data fields to the locked JSON shape.
 
     Shape contract (LOCKED to Story 2.4's writer for round-trip
     fidelity):
@@ -181,17 +240,36 @@ def _serialize_snapshot(snapshot: WorkspaceSnapshotInput) -> str:
 
     Extending this shape breaks 2.4-vs-3.1 round-trip equality — Story
     4.3 owns any shape evolution.
+
+    Story 3.7 introduces this lower-level helper so both
+    :func:`_serialize_snapshot` (for ``store_snapshot`` taking a
+    :class:`WorkspaceSnapshotInput`) and :meth:`commit_shutdown` (for
+    the inline shutdown-snapshot row) produce byte-identical JSON.
     """
     payload: dict[str, object] = {
-        "apps": list(snapshot.apps),
-        "focused_app": snapshot.focused_app,
-        "mode_name": snapshot.mode_name,
+        "apps": list(apps),
+        "focused_app": focused_app,
+        "mode_name": mode_name,
     }
     return json.dumps(
         payload,
         separators=(",", ":"),
         ensure_ascii=False,
         allow_nan=False,
+    )
+
+
+def _serialize_snapshot(snapshot: WorkspaceSnapshotInput) -> str:
+    """Serialize a :class:`WorkspaceSnapshotInput` to the locked JSON shape.
+
+    Thin wrapper around :func:`_serialize_workspace_data` — extracts
+    the three payload fields and delegates. See the lower-level
+    helper for the full shape contract.
+    """
+    return _serialize_workspace_data(
+        apps=snapshot.apps,
+        focused_app=snapshot.focused_app,
+        mode_name=snapshot.mode_name,
     )
 
 
@@ -261,44 +339,178 @@ class SqliteBrainAdapter:
 
         Returns the stamped ``ended_at`` ISO-8601 string so callers can
         reuse it for a companion audit write without re-sampling the
-        clock (the setup seam in
-        :func:`nova.setup.initial_capture.persist_first_run` uses this
-        to keep ``sessions.ended_at`` byte-equal to
-        ``audit_log.timestamp`` under the one-transaction invariant).
+        clock.
 
-        ``ended_at`` is always adapter-stamped via
-        ``events._utc_now_iso()`` at call time — callers never pass
-        their own timestamp. This matches Story 2.4 AC #12: inside the
-        setup transaction, ``end_session`` is called AFTER
-        ``store_snapshot``, so ``ended_at`` naturally lands after the
-        snapshot INSERT.
+        Idempotency (Story 3.7 — closes deferred-work.md:231):
+        the UPDATE includes ``WHERE id = ? AND is_complete = 0`` so a
+        re-call on an already-finalized session is a clean no-op. In
+        that case the adapter does an explicit SELECT to fetch the
+        EXISTING ``ended_at`` and returns it (the caller still receives
+        a stable timestamp). A WARNING log fires on the no-op branch.
 
-        A zero-row UPDATE is treated as a programmer error. Before the
-        UPDATE, the adapter issues a SELECT to verify the session
-        exists; if it does not, a WARNING is logged with the offending
-        id. The UPDATE still runs (and is a no-op in that case) — the
-        adapter does not raise. Story 3.5's Nerve never calls
-        ``end_session`` with an unknown id under normal flow, so this
-        is pure observability for programmer errors.
+        Three branches:
+
+        1. Row missing → WARNING, stamp ``ended_at`` defensively,
+           UPDATE is a no-op (programmer error).
+        2. Row exists AND ``is_complete = 1`` → WARNING, return EXISTING
+           ``ended_at``, UPDATE filter blocks the write.
+        3. Row exists AND ``is_complete = 0`` → normal path; stamp
+           via ``events._utc_now_iso()`` and proceed.
+
+        The Story 3.5 cleanup path (``_cleanup_after_repl`` writes
+        ``is_complete=False``) and the Story 3.10 signal handler are
+        unaffected — both write ``is_complete=False`` against rows
+        that haven't been finalized yet. Story 3.7's user-typed
+        shutdown does NOT call ``end_session`` (uses
+        :meth:`commit_shutdown` instead).
         """
         logger.debug("brain.end_session start", extra={"session_id_opaque": "<int>"})
-        ended_at = events._utc_now_iso()
-        # Pre-UPDATE existence probe: AC #8 promises a WARNING log for
-        # zero-row updates. Single extra fetchone per end_session call
-        # is cheap next to the transaction cost.
+        # Pre-UPDATE inspection — fetch ``ended_at`` + ``is_complete``
+        # so the method can branch on the row's current state. The
+        # already-complete branch returns the existing ``ended_at``
+        # without re-stamping the clock (idempotency guard); the
+        # missing-row branch stamps defensively + logs WARNING.
         existing = await self._storage.fetchone(
-            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+            "SELECT ended_at, is_complete FROM sessions WHERE id = ?", (session_id,)
         )
         if existing is None:
             logger.warning(
                 "brain.end_session matched zero rows; UPDATE will be a no-op",
                 extra={"session_id": session_id},
             )
+            ended_at = events._utc_now_iso()
+        elif existing["is_complete"]:
+            logger.warning(
+                "brain.end_session re-called on already-completed session; UPDATE was a no-op",
+                extra={"session_id": session_id},
+            )
+            existing_ended_at = existing["ended_at"]
+            # If the row is is_complete=1 then ended_at MUST be set
+            # (the schema invariant — every UPDATE that flips
+            # is_complete also stamps ended_at). Defensive str() in
+            # case sqlite3 returns a non-string for some reason.
+            return str(existing_ended_at)
+        else:
+            ended_at = events._utc_now_iso()
         is_complete_int = 1 if is_complete else 0
         await self._storage.execute(
             _UPDATE_SESSION_END_SQL,
             (ended_at, seed_text, summary, is_complete_int, session_id),
         )
+        return ended_at
+
+    async def commit_shutdown(self, session_id: int, commit: ShutdownCommit) -> str:
+        """Atomically finalize a session via three transactional writes.
+
+        Wraps the ``sessions`` UPDATE + ``memory_items`` INSERT (when
+        seed entered) + ``workspace_snapshots`` INSERT in a single
+        ``engine.transaction()`` block — either all rows land or none
+        do. Returns the stamped ``ended_at`` ISO-8601 string, which is
+        also written verbatim to the ``memory_items.created_at`` column
+        (when a seed is captured) and the
+        ``workspace_snapshots.captured_at`` column. Cross-row timestamp
+        consistency is structural; caller-supplied timestamps are
+        deliberately absent from :class:`ShutdownCommit`.
+
+        Idempotency (full — not just the session UPDATE):
+
+        * **Row missing** → :class:`StorageError`. ``commit_shutdown``
+          requires a session row created by :meth:`create_session`;
+          calling without one is a programmer error and surfaces
+          loudly rather than silently inserting orphan
+          ``memory_items`` / ``workspace_snapshots`` rows whose
+          foreign keys would dangle.
+        * **Row already complete** (``is_complete = 1``) → return the
+          EXISTING ``ended_at`` from the row; SKIP all three writes.
+          A re-call must NOT create duplicate seed memory rows or
+          duplicate shutdown snapshots. WARNING log fires.
+        * **Row incomplete** (``is_complete = 0``) → normal path.
+          Stamp ``ended_at`` once, run all three writes inside the
+          transaction.
+
+        Transaction rollback: any exception inside the
+        ``async with self._storage.transaction()`` block triggers a
+        SQLite ``ROLLBACK``. The engine translates ``sqlite3.Error`` /
+        ``sqlite3.Warning`` / ``OSError`` to :class:`StorageError` at
+        its boundary; the adapter does NOT add a wrapping try/except
+        (would break the engine's translation contract — same pattern
+        as :meth:`store_snapshot`).
+        """
+        logger.debug("brain.commit_shutdown start", extra={"session_id_opaque": "<int>"})
+        async with self._storage.transaction():
+            # Pre-write inspection — branch on the row's current state
+            # BEFORE any of the three writes. Inside the transaction so
+            # the SELECT and the three writes share a snapshot (no
+            # other writer can flip is_complete between the check and
+            # the writes).
+            existing = await self._storage.fetchone(
+                "SELECT ended_at, is_complete FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            if existing is None:
+                # Programmer error — commit_shutdown requires an
+                # existing session row. Surface loudly rather than
+                # silently inserting orphan memory_items /
+                # workspace_snapshots rows.
+                raise StorageError(f"brain.commit_shutdown: session_id={session_id} does not exist")
+            if existing["is_complete"]:
+                # Re-call on already-finalized session — skip all
+                # three writes; return the existing ended_at so the
+                # caller still gets a stable timestamp.
+                logger.warning(
+                    "brain.commit_shutdown re-called on already-completed session; "
+                    "all three writes skipped",
+                    extra={"session_id": session_id},
+                )
+                return str(existing["ended_at"])
+            # Row exists AND is_complete = 0 — proceed with the
+            # three-write commit.
+            ended_at = events._utc_now_iso()
+            # Normalize empty-string seed_text to None so phase 1 writes
+            # NULL (not "") into ``sessions.seed_text`` AND phase 2
+            # skips the memory_items INSERT. Keeps the two writes
+            # consistent even if a future caller bypasses Nerve's
+            # whitespace-strip and passes ``""``. Adapter-level defense.
+            effective_seed = commit.seed_text if commit.seed_text else None
+            # Phase 1 — finalize the session row. ``snapshot_mode_name``
+            # carries the canonical stem (Story 3.6 invariant); it
+            # serves as both the workspace_snapshot mode AND the
+            # ``sessions.mode_name`` value so ``get_mode_last_used``
+            # finds the session at next startup. ``None`` is acceptable
+            # (writes NULL) — bare-boot shutdown with no active mode
+            # leaves the column NULL, matching the create_session
+            # default.
+            await self._storage.execute(
+                _UPDATE_SESSION_COMMIT_SHUTDOWN_SQL,
+                (
+                    ended_at,
+                    effective_seed,
+                    commit.summary,
+                    commit.snapshot_mode_name,
+                    session_id,
+                ),
+            )
+            # Phase 2 — INSERT memory_items only when a seed was captured.
+            if effective_seed is not None:
+                await self._storage.execute(
+                    _INSERT_MEMORY_ITEM_SHUTDOWN_SQL,
+                    (
+                        session_id,
+                        str(MemoryCategory.SEED),
+                        effective_seed,
+                        ended_at,
+                    ),
+                )
+            # Phase 3 — INSERT workspace_snapshots row.
+            workspace_data = _serialize_workspace_data(
+                apps=commit.snapshot_apps,
+                focused_app=commit.snapshot_focused_app,
+                mode_name=commit.snapshot_mode_name,
+            )
+            await self._storage.execute(
+                _INSERT_SHUTDOWN_SNAPSHOT_SQL,
+                (session_id, ended_at, str(SnapshotType.SHUTDOWN), workspace_data),
+            )
         return ended_at
 
     async def get_last_session(self) -> SessionSummary | None:

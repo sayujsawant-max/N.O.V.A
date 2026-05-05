@@ -7,6 +7,15 @@ persisted-fact methods the epic 3.1 / 3.2 ACs specify.
 ``SqliteBrainAdapter`` (:mod:`nova.adapters.sqlite.brain`) is the T1
 concrete implementation.
 
+Story 3.7 introduces ``commit_shutdown`` as the atomic three-write
+shutdown-finalization surface. The adapter wraps the ``sessions``
+UPDATE + ``memory_items`` INSERT (when seed entered) +
+``workspace_snapshots`` INSERT in a single ``engine.transaction()``
+so partial-state failure is impossible. The single source of truth
+for ``ended_at`` / ``created_at`` / ``captured_at`` cross-row
+consistency lives in the adapter — callers do NOT supply timestamps
+on the ``ShutdownCommit`` DTO.
+
 Epic 5 methods (``query_memory``, ``delete_matching``,
 ``confirm_deletion``, ``get_transparency_model``) stay as Protocol
 declarations; Story 3.1's adapter stubs each with
@@ -30,6 +39,7 @@ from nova.systems.brain.models import (
     DeletionResult,
     MemoryItem,
     SessionSummary,
+    ShutdownCommit,
     TransparencyModel,
     WorkspaceSnapshotInput,
 )
@@ -60,6 +70,8 @@ class BrainPort(Protocol):
         summary: str | None,
         is_complete: bool,
     ) -> str: ...
+
+    async def commit_shutdown(self, session_id: int, commit: ShutdownCommit) -> str: ...
 
     async def get_last_session(self) -> SessionSummary | None: ...
 

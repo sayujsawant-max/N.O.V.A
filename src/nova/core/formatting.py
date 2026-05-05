@@ -1,13 +1,14 @@
-"""Render-safe formatting helpers used at any system → Skin boundary.
+"""Render-safe formatting + parsing helpers used at any system → Skin boundary.
 
 Stages new helpers here rather than inlining at the use site so duration
 / datetime / mode-name normalization rules are reused, not duplicated
 (project-context.md §57 "Formatting/parsing must be centralized").
 
 Story 3.3 introduces this module with one helper:
-:func:`format_duration_seconds`. Future formatters (datetime, mode-name
-normalization) join the same module rather than fragmenting across
-``nova.core.*``.
+:func:`format_duration_seconds`. Story 3.7 adds the parse-side
+companion :func:`diff_iso_seconds` so both Ritual (shutdown view-model
+duration) and Nerve (session-summary text) use the same ISO-8601
+parser without inter-system imports.
 
 Policy split — value-based formatting only
 ------------------------------------------
@@ -26,6 +27,8 @@ by Ritual's :func:`~nova.systems.ritual.system._build_last_session_label`
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 
 def format_duration_seconds(seconds: int) -> str:
@@ -64,4 +67,38 @@ def format_duration_seconds(seconds: int) -> str:
     return f"{hours}h {minutes}m"
 
 
-__all__: list[str] = ["format_duration_seconds"]
+def _parse_iso(iso: str) -> datetime:
+    """``datetime.fromisoformat`` with trailing-``Z`` normalization.
+
+    Python 3.11+'s ``fromisoformat`` parses ``"...Z"`` natively; earlier
+    versions require a swap to ``"...+00:00"``. Project targets 3.11+
+    but the swap costs nothing and locks the parser against future
+    input drift.
+    """
+    if iso.endswith("Z"):
+        iso = iso[:-1] + "+00:00"
+    return datetime.fromisoformat(iso)
+
+
+def diff_iso_seconds(start_iso: str, end_iso: str) -> int:
+    """Return ``(end - start)`` in integer seconds, clamped to ``>= 0``.
+
+    Tolerates the trailing-``Z`` form
+    (``"2026-05-05T14:23:01Z"``) by routing through
+    :func:`_parse_iso` before subtraction. Negative results clamp to
+    ``0`` (clock skew / NTP slew / corrupt persisted timestamp
+    defense).
+
+    Public surface — Story 3.7's Nerve session-summary builder
+    (:func:`~nova.systems.nerve.system._build_session_summary_text`)
+    and Ritual's shutdown view-model assembly
+    (:meth:`~nova.systems.ritual.system.RitualSystem.begin_shutdown`)
+    both call this. Locking the parsing rule in one place per
+    project-context.md "no magic literals for cross-cutting rules".
+    """
+    start_dt = _parse_iso(start_iso)
+    end_dt = _parse_iso(end_iso)
+    return max(0, int((end_dt - start_dt).total_seconds()))
+
+
+__all__: list[str] = ["diff_iso_seconds", "format_duration_seconds"]

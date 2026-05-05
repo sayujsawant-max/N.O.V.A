@@ -45,11 +45,15 @@ from __future__ import annotations
 
 import logging
 
-from nova.core.formatting import format_duration_seconds
+from nova.core.formatting import diff_iso_seconds, format_duration_seconds
 from nova.core.types import BriefingState, CapabilityTier
 from nova.systems.brain.models import BriefingAggregate, ModeInfo, SessionSummary
 from nova.systems.eyes.models import WorkspaceSnapshot
-from nova.systems.ritual.models import BriefingViewModel, ShutdownData
+from nova.systems.ritual.models import (
+    BriefingViewModel,
+    ShutdownState,
+    ShutdownViewModel,
+)
 
 logger = logging.getLogger("nova.systems.ritual")
 
@@ -58,6 +62,9 @@ logger = logging.getLogger("nova.systems.ritual")
 _STATE_A_INTRO_LINE_1: str = "First session. No history yet — that's expected."
 _STATE_A_INTRO_LINE_2: str = "Let's set up your first workspace mode so tomorrow starts warm."
 _STATE_B_INTRO_LINE: str = "No saved seed from your last session."
+
+_SHUTDOWN_TITLE: str = "Session ending"
+_SEED_PROMPT_TEXT: str = "What should you pick up tomorrow?"
 
 # --- Internal label-builder helpers (private; tests may import) --------------
 
@@ -410,8 +417,52 @@ class RitualSystem:
         # finding P1.
         raise ValueError(f"Unhandled BriefingState: {state!r}")
 
-    async def begin_shutdown(self) -> ShutdownData:
-        raise NotImplementedError("Story 3.7 scope")
+    async def begin_shutdown(self, state: ShutdownState) -> ShutdownViewModel:
+        """Assemble a render-ready :class:`ShutdownViewModel` from runtime state.
+
+        Pure transformation — no I/O, no clock reads (Nerve owns clock
+        sampling and passes ``ended_at`` in the state). Mirrors
+        :meth:`build_briefing`'s stateless contract.
+
+        Locked-copy fields:
+
+        * ``title`` = ``"Session ending"``
+        * ``prompt_text`` = ``"What should you pick up tomorrow?"``
+
+        Pre-rendered labels:
+
+        * ``mode_label`` — ``f"Mode: {display_name}"`` or ``None`` when
+          no active mode. ``_escape_label_value`` not needed here:
+          single field, no comma-separated join.
+        * ``duration_label`` — ``f"Duration: {format_duration_seconds(...)}"``,
+          always present. :func:`diff_iso_seconds` already clamps
+          negative durations to ``0``.
+        * ``apps_label`` — ``f"Apps: {', '.join(escaped names)}"`` or
+          ``None`` when ``apps_used`` is empty. Each name passes
+          through :func:`_escape_label_value` for comma-disambiguation
+          (Story 3.3 precedent).
+        """
+        duration_seconds = diff_iso_seconds(state.started_at, state.ended_at)
+        duration_display = format_duration_seconds(duration_seconds)
+        mode_label = (
+            f"Mode: {state.active_mode_display_name}"
+            if state.active_mode_display_name is not None
+            else None
+        )
+        apps_label: str | None
+        if state.apps_used:
+            escaped = ", ".join(_escape_label_value(name) for name in state.apps_used)
+            apps_label = f"Apps: {escaped}"
+        else:
+            apps_label = None
+        return ShutdownViewModel(
+            session_id=state.session_id,
+            title=_SHUTDOWN_TITLE,
+            mode_label=mode_label,
+            duration_label=f"Duration: {duration_display}",
+            apps_label=apps_label,
+            prompt_text=_SEED_PROMPT_TEXT,
+        )
 
 
 __all__: list[str] = ["RitualSystem"]

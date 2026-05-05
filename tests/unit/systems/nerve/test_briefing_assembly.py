@@ -37,6 +37,7 @@ from nova.systems.brain.models import (
     DeletionResult,
     MemoryItem,
     SessionSummary,
+    ShutdownCommit,
     TransparencyModel,
     WorkspaceSnapshotInput,
 )
@@ -88,6 +89,9 @@ class _RecordingFakeBrainPort:
         is_complete: bool,
     ) -> str:
         raise NotImplementedError("fake does not support end_session")
+
+    async def commit_shutdown(self, session_id: int, commit: ShutdownCommit) -> str:
+        raise NotImplementedError("fake does not support commit_shutdown")
 
     async def get_last_session(self) -> SessionSummary | None:
         self.calls.append(_Call("get_last_session", ()))

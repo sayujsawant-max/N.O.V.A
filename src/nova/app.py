@@ -252,6 +252,7 @@ async def create_app(
             tier_manager=tier_manager,
             config=config,
             hands=hands,
+            audit=audit,
         )
         logger.info("nerve system wired", extra={"system": type(nerve).__name__})
 

@@ -102,18 +102,23 @@ import signal
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Literal
 
+from nova.core import events
+from nova.core.audit import RESULT_FAILED, RESULT_SKIPPED, RESULT_SUCCESS, AuditLogger
 from nova.core.config import NovaConfig, UserSettings
-from nova.core.events import EventBus, SessionEnded, SessionStarted
+from nova.core.events import EventBus, SeedSaved, SessionEnded, SessionStarted
+from nova.core.formatting import diff_iso_seconds, format_duration_seconds
 from nova.core.tiers import TierManager
-from nova.core.types import BriefingState, CapabilityTier
+from nova.core.types import ActionType, BriefingState, CapabilityTier
 from nova.ports.brain import BrainPort
 from nova.ports.hands import HandsPort
 from nova.ports.ritual import RitualPort
 from nova.ports.skin import SkinPort
-from nova.systems.brain.models import SessionSummary
+from nova.systems.brain.models import SessionSummary, ShutdownCommit
 from nova.systems.nerve.briefing import determine_briefing_state, load_briefing_aggregate
 from nova.systems.nerve.models import CommandOutcome
+from nova.systems.ritual.models import ShutdownState
 from nova.systems.skin.models import Command, CommandVerb
 
 logger = logging.getLogger("nova.systems.nerve")
@@ -135,6 +140,93 @@ def _utc_now() -> datetime:
     arithmetic in :func:`_should_skip_briefing`.
     """
     return datetime.now(UTC)  # pragma: no cover - production default; tests inject
+
+
+# --- Shutdown helpers (Story 3.7) -------------------------------------------
+
+
+# Closed-set outcome string returned by ``_collect_seed_with_reprompt`` and
+# consumed by ``_classify_audit_outcome``. Three mutually-exclusive states:
+#
+# * ``"saved"`` — seed text was entered (on attempt 0 OR attempt 1).
+# * ``"cancelled"`` — terminator (``"skip"`` / ``"cancel"``, case-insensitive)
+#   typed at any attempt OR EOF / KeyboardInterrupt at any attempt.
+# * ``"empty_twice"`` — both attempts returned empty/whitespace AND no
+#   terminator was typed.
+#
+# A ``Literal`` (not an enum) keeps the value JSON-friendly for the
+# ``audit_log.details["outcome"]`` field — the audit serializer handles
+# strings cleanly and downstream transparency queries (Story 5.1) can match
+# on the string value without enum coercion.
+_SeedOutcome = Literal["saved", "cancelled", "empty_twice"]
+
+# Closed-set seed-prompt cancel terminators. Module-scope so the frozenset
+# is built once at import time, not per-call. Used by
+# ``_collect_seed_with_reprompt`` for exact-match-after-strip
+# case-insensitive comparison — ``"cancel my plan"`` is treated as seed
+# text, NOT a cancel.
+_CANCEL_TERMINATORS: frozenset[str] = frozenset({"skip", "cancel"})
+
+
+def _build_session_summary_text(state: ShutdownState) -> str | None:
+    """Compose the ``sessions.summary`` column value from runtime state.
+
+    Returns ``None`` when no mode was active OR the display name is
+    empty / whitespace-only — the row's summary column stays NULL in
+    that case (forward-compatible with Voice generating a richer
+    summary in Epic 7; defense-in-depth against a config-corruption
+    path that delivers an empty display label).
+
+    Format: ``"{display_name} mode, {duration}"`` (mirrors the
+    briefing's ``last_session_label`` shape — Story 3.3's
+    ``_build_last_session_label``). The display name is escaped via
+    the same ``backslash`` → ``\\\\`` then ``,`` → ``\\,`` rule
+    Story 3.3 introduced for the briefing card's comma-separated
+    labels — a mode named ``"Coding, Tests"`` produces
+    ``"Coding\\, Tests mode, 30m"`` rather than the ambiguous
+    ``"Coding, Tests mode, 30m"``. The escape rule is currently
+    duplicated with :func:`nova.systems.ritual.system._escape_label_value`;
+    a future cleanup may promote it to ``nova.core.formatting`` once a
+    third caller appears.
+
+    ``diff_iso_seconds`` already clamps negative durations to ``0``
+    so this helper does NOT re-wrap.
+    """
+    display = (state.active_mode_display_name or "").strip()
+    if not display:
+        return None
+    escaped_display = display.replace("\\", "\\\\").replace(",", "\\,")
+    duration_seconds = diff_iso_seconds(state.started_at, state.ended_at)
+    duration_display = format_duration_seconds(duration_seconds)
+    return f"{escaped_display} mode, {duration_display}"
+
+
+def _classify_audit_outcome(outcome: _SeedOutcome) -> str:
+    """Map a seed-collection outcome to the audit ``result`` value.
+
+    * ``"saved"`` → :data:`RESULT_SUCCESS`
+    * ``"cancelled"`` / ``"empty_twice"`` → :data:`RESULT_SKIPPED`
+    * Any other value → :class:`ValueError`. A future fourth
+      ``_SeedOutcome`` member must be classified explicitly here
+      (``Literal`` lets mypy catch the missing branch at the call
+      site, but a runtime regression that bypasses type-checking
+      would silently default to ``RESULT_SKIPPED`` without the
+      explicit raise).
+
+    The ``outcome`` string itself is written to the
+    ``audit_log.details["outcome"]`` field at the call site — no
+    second mapping needed.
+
+    The persistence-failed path uses :data:`RESULT_FAILED` with
+    ``details["outcome"] = "persistence_failed"`` and is handled
+    inline in the except branch of ``_handle_shutdown``; it does NOT
+    go through this classifier.
+    """
+    if outcome == "saved":
+        return RESULT_SUCCESS
+    if outcome in ("cancelled", "empty_twice"):
+        return RESULT_SKIPPED
+    raise ValueError(f"unknown _SeedOutcome member: {outcome!r}")
 
 
 # --- Skip-briefing pure helper (Story 3.5 AC #7) ----------------------------
@@ -220,6 +312,7 @@ class NerveSystem:
         tier_manager: TierManager,
         config: NovaConfig,
         hands: HandsPort,
+        audit: AuditLogger,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._brain = brain
@@ -229,6 +322,7 @@ class NerveSystem:
         self._tier_manager = tier_manager
         self._config = config
         self._hands = hands
+        self._audit = audit
         self._clock = clock
         # Lifecycle state — initialized at the start of every startup() call
         # so a re-invocation (e.g., a future story that supports re-entry)
@@ -247,6 +341,18 @@ class NerveSystem:
         # ModeRestored.mode_name event field; its value is always the
         # stem (kebab-case YAML basename), NOT the display label.
         self._active_mode_name: str | None = None
+        # Story 3.7 — apps successfully launched by the LAST successful
+        # mode-restore. Tuple of display names (mode_config.apps[i].name).
+        # Used by the shutdown summary's "Apps used" line and the shutdown
+        # workspace_snapshot's apps tuple. NOT cumulative across mode
+        # switches — multi-mode sessions show only the active mode's apps
+        # (T1 simplicity; cumulative-with-dedup is deferred).
+        self._active_mode_apps_launched: tuple[str, ...] = ()
+        # Story 3.7 — session start timestamp. Stamped in startup() step 9
+        # before brain.create_session so Nerve has the value at shutdown
+        # time for duration computation. Cleared on _cleanup_after_repl
+        # alongside _session_active.
+        self._session_started_at: str | None = None
         # Track which sync handler we replaced on Windows so uninstall
         # restores the prior behavior instead of silently dropping it.
         self._previous_sigint_handler: object | None = None
@@ -330,10 +436,20 @@ class NerveSystem:
 
             # Step 9 — create the runtime session. NOW — only after the
             # prior-state reads are done and the briefing has rendered (or
-            # been skipped). Set _session_active AFTER create_session
-            # returns the id so a Brain failure leaves _session_active
-            # False and the finally cleanup is a clean no-op.
-            self._session_id = await self._brain.create_session(mode_name=None, started_at=None)
+            # been skipped).
+            #
+            # Story 3.7 — stamp ``started_at`` HERE so Nerve has the
+            # value at shutdown time for duration computation. The
+            # Brain-side ``started_at=None`` branch resamples internally
+            # but never returns the stamped value — Nerve must own the
+            # stamp to observe it. ``_session_active`` flips AFTER
+            # create_session returns so a Brain failure leaves it False
+            # and the finally cleanup is a clean no-op.
+            started_at = events._utc_now_iso()
+            self._session_id = await self._brain.create_session(
+                mode_name=None, started_at=started_at
+            )
+            self._session_started_at = started_at
             self._session_active = True
 
             # Step 10 — persist-before-emit. SessionStarted only AFTER the
@@ -492,6 +608,18 @@ class NerveSystem:
                     except Exception:
                         logger.exception("startup cleanup: SessionEnded emission failed")
         finally:
+            # Story 3.7 — reset Story 3.6 / 3.7 mode-tracking + session-
+            # start fields in the finally so they clear even when the
+            # cleanup-path Brain write raises an unanticipated exception
+            # (BaseException like CancelledError would skip a try-body
+            # reset). Today's contract is one startup() per process, but
+            # the cleanup discipline matches the existing
+            # _session_active reset and matches _uninstall_signal_handler
+            # which has been in the finally since Story 3.5. Fields are
+            # in-memory state, not durable — safe to clear unconditionally.
+            self._active_mode_name = None
+            self._active_mode_apps_launched = ()
+            self._session_started_at = None
             self._uninstall_signal_handler()
 
     # --- Internal: REPL loop -----------------------------------------------
@@ -891,8 +1019,16 @@ class NerveSystem:
         # Story 3.7's shutdown summary and Story 3.9's status.
         if any(r.success for r in results):
             self._active_mode_name = mode_stem
+            # Story 3.7 — pair each app config with its result and
+            # keep only successful launches. zip is safe: HandsSystem
+            # returns one ActionResult per app in mode_config.apps
+            # order (Story 3.6 contract).
+            self._active_mode_apps_launched = tuple(
+                app.name for app, r in zip(mode_config.apps, results, strict=True) if r.success
+            )
         else:
             self._active_mode_name = None
+            self._active_mode_apps_launched = ()
         return CommandOutcome.CONTINUE
 
     async def _handle_mode_create(self, command: Command) -> CommandOutcome:
@@ -947,78 +1083,187 @@ class NerveSystem:
         return CommandOutcome.CONTINUE
 
     async def _handle_shutdown(self, command: Command) -> CommandOutcome:
-        """Idempotent clean shutdown.
+        """Delegate the shutdown ceremony to Ritual; orchestrate Skin + Brain.
 
-        Story 3.7 will replace this body with a delegation to
-        :meth:`RitualPort.begin_shutdown` (the seed-prompt ceremony).
-        Until then, end the session cleanly via Brain with
-        ``is_complete=True`` and emit ``SessionEnded`` write-then-emit.
+        Idempotent: a second SHUTDOWN call after the transactional
+        commit succeeds short-circuits on ``_session_active=False``
+        (returns ``EXIT`` cleanly). The flip to ``False`` happens
+        AFTER ``brain.commit_shutdown`` returns successfully — if the
+        transaction fails, ``_session_active`` stays ``True`` and
+        :meth:`_cleanup_after_repl` writes the ``is_complete=False``
+        interrupted-session marker as the durable record (Story 3.10
+        detects it on next startup). The atomic transaction guarantees
+        no partial state — either all three rows landed or none did.
 
-        Idempotency: the ``_session_active`` guard makes a second call
-        a clean no-op (returns ``EXIT`` without re-writing or
-        re-emitting). This handles the signal-handler-then-SHUTDOWN race
-        and the two-paths-to-shutdown race (EOF triggers
-        ``_handle_shutdown`` AND the user typed ``shutdown``).
-
-        Best-effort = ONE attempt at the user's intended outcome
-        ----------------------------------------------------------
-        ``_session_active`` is flipped to ``False`` BEFORE the Brain
-        ``end_session`` await. This is deliberate: if the Brain write
-        raises, we do NOT want :meth:`_cleanup_after_repl` to retry
-        with ``is_complete=False`` — that would silently overwrite the
-        user's clean-shutdown intent with an interrupted-marker. On
-        Brain failure here we log + return EXIT cleanly; the row stays
-        in whatever state Brain last saw, and Story 3.10's next-startup
-        interrupted-session detection picks it up. Same posture as the
-        signal handler.
-
-        Why no timeout (vs the signal handler's 2s)
-        --------------------------------------------
-        The signal handler bounds its Brain write to 2 seconds because
-        it runs in a constrained context — no human is available to
-        intervene if the write hangs. ``_handle_shutdown`` runs because
-        the user typed ``shutdown`` interactively; the user CAN press
-        Ctrl-C if it hangs, which falls back to the signal-handler path
-        that IS bounded. Adding a timeout here would risk masking real
-        Brain bugs as "interrupted session" markers and surprise the
-        user. The user retains agency: hung Brain → Ctrl-C → bounded
-        fallback.
+        The seed-prompt loop is bounded: empty input reprompts ONCE,
+        then cancels. ``skip`` / ``cancel`` (case-insensitive) short-
+        circuit immediately. EOFError / KeyboardInterrupt during the
+        prompt are treated like cancel — no exception propagates out
+        of this method.
         """
         del command
         if not self._session_active:
             return CommandOutcome.EXIT
-        # _session_active=True implies _session_id was set in startup() step 9.
         assert self._session_id is not None
-        # Flip BEFORE the await so a Brain failure doesn't trigger a cleanup
-        # retry. See "Best-effort = ONE attempt" docstring section above.
-        self._session_active = False
+        assert self._session_started_at is not None  # set in startup() step 9
+
+        # Step 1 — sample clock once for state assembly. Used only for the
+        # duration display (the durable ended_at/created_at/captured_at all
+        # come from the adapter inside commit_shutdown — single source of
+        # truth for cross-row timestamp consistency).
+        state_ended_at = events._utc_now_iso()
+        active_mode_display_name = self._resolve_active_mode_display_name()
+        state = ShutdownState(
+            session_id=self._session_id,
+            started_at=self._session_started_at,
+            ended_at=state_ended_at,
+            active_mode_stem=self._active_mode_name,
+            active_mode_display_name=active_mode_display_name,
+            apps_used=self._active_mode_apps_launched,
+        )
+
+        # Step 2 — Ritual produces the render-ready view model.
+        view_model = await self._ritual.begin_shutdown(state)
+
+        # Step 3 — render the shutdown card BEFORE the seed prompt.
+        await self._skin.render_shutdown_card(view_model)
+
+        # Step 4 — drive the seed prompt with bounded reprompt.
+        seed_text, seed_outcome = await self._collect_seed_with_reprompt(view_model.prompt_text)
+
+        # Step 5 — assemble the rendered summary string for sessions.summary.
+        summary_text = _build_session_summary_text(state)
+
+        # Step 6 — atomic Brain commit. Three writes (sessions UPDATE +
+        # memory_items INSERT when seed_text not None + workspace_snapshots
+        # INSERT) inside a single engine.transaction() — all land or none
+        # do. Adapter stamps ended_at/created_at/captured_at once
+        # internally and uses the SAME value for every row.
+        commit = ShutdownCommit(
+            seed_text=seed_text,
+            summary=summary_text,
+            snapshot_apps=self._active_mode_apps_launched,
+            snapshot_focused_app=None,
+            snapshot_mode_name=self._active_mode_name,
+        )
         try:
-            await self._brain.end_session(
-                self._session_id,
-                seed_text=None,
-                summary=None,
-                is_complete=True,
-            )
+            await self._brain.commit_shutdown(self._session_id, commit)
         except Exception:
-            logger.exception("user-typed shutdown: brain.end_session failed")
-            # Don't render confirmation — user should know something went
-            # wrong; the missing "Session ended." line surfaces that.
-            # Don't emit SessionEnded — write didn't confirm.
+            # Transaction rolled back — no partial state. Audit the
+            # failure, render an honest error, leave _session_active=True
+            # so _cleanup_after_repl writes the is_complete=False marker.
+            logger.exception("shutdown: commit_shutdown failed; session will be marked interrupted")
+            await self._audit.log_action(
+                action_type=ActionType.SEED_CAPTURE,
+                target=str(self._session_id),
+                result=RESULT_FAILED,
+                details={
+                    "has_seed": seed_text is not None,
+                    "outcome": "persistence_failed",
+                },
+            )
+            await self._skin.render_response(
+                "Shutdown failed: state may be inconsistent. Check logs."
+            )
             return CommandOutcome.EXIT
+
+        # Step 7 — only NOW flip _session_active: transaction confirmed.
+        self._session_active = False
+
+        # Step 8 — audit row (after writes, before emission). Single
+        # unwrapped call — AuditLogger swallows StorageError internally
+        # (Story 1.8); Nerve does NOT wrap (would mask programmer errors).
+        await self._audit.log_action(
+            action_type=ActionType.SEED_CAPTURE,
+            target=str(self._session_id),
+            result=_classify_audit_outcome(seed_outcome),
+            details={"has_seed": seed_text is not None, "outcome": seed_outcome},
+        )
+
+        # Step 9 — events. SeedSaved only when seed entered. Each
+        # emission is wrapped — emission failures are observability-only;
+        # the commit already confirmed durability. The confirmation in
+        # step 10 fires regardless of emission outcome.
+        if seed_text is not None:
+            try:
+                await self._event_bus.emit(
+                    SeedSaved(session_id=self._session_id, seed_text=seed_text)
+                )
+            except Exception:
+                logger.exception("shutdown: SeedSaved emission failed (commit already confirmed)")
         try:
             await self._event_bus.emit(
                 SessionEnded(
                     session_id=self._session_id,
-                    seed_text=None,
+                    seed_text=seed_text,
                     is_complete=True,
                 )
             )
         except Exception:
-            # Brain write succeeded; emission is observability only.
-            # Log and continue to render the confirmation.
-            logger.exception("user-typed shutdown: SessionEnded emission failed")
-        await self._skin.render_response("Session ended.")
+            logger.exception("shutdown: SessionEnded emission failed (commit already confirmed)")
+
+        # Step 10 — final-line confirmation. Voice (Epic 7) will dress.
+        confirmation = "Planted for tomorrow." if seed_text is not None else "Cancelled."
+        await self._skin.render_response(confirmation)
         return CommandOutcome.EXIT
+
+    def _resolve_active_mode_display_name(self) -> str | None:
+        """Look up the active mode's display label via :attr:`_config.modes`.
+
+        Returns ``None`` when ``_active_mode_name`` is ``None`` OR the
+        mode was deleted between switch and shutdown (defensive — should
+        not happen in a single session, but config-reload paths might
+        enable it). Mirrors Story 3.3's progressive-omission contract.
+        """
+        if self._active_mode_name is None:
+            return None
+        mode_config = self._config.modes.get(self._active_mode_name)
+        if mode_config is None:
+            return None
+        return mode_config.name
+
+    async def _collect_seed_with_reprompt(
+        self, prompt_text: str
+    ) -> tuple[str | None, _SeedOutcome]:
+        """Bounded seed-input loop: 2 attempts maximum.
+
+        Returns ``(seed_text, outcome)``:
+
+        * ``seed_text`` — the entered text stripped of leading/trailing
+          whitespace, OR ``None`` for any non-saved outcome.
+        * ``outcome`` — closed set: ``"saved"`` (seed_text non-None),
+          ``"cancelled"`` (terminator typed OR EOF/KbdInt at ANY
+          attempt), ``"empty_twice"`` (both attempts returned empty,
+          no terminator).
+
+        Cancel terminators are exact-match case-insensitive: ``"skip"``,
+        ``"cancel"`` — NOT substring matching. ``"cancel my plan"`` is
+        seed text, not a cancel.
+
+        Empty input on the first attempt reprompts once with
+        ``"Please confirm or cancel."``. Empty input on the second
+        attempt → ``(None, "empty_twice")``. A terminator on the second
+        attempt → ``(None, "cancelled")`` — the user explicitly chose
+        to cancel after the reprompt, distinct from the silent-empty
+        path.
+        """
+        attempt_prompt = prompt_text
+        for attempt in range(2):
+            try:
+                raw = await self._skin.collect_input(prompt=attempt_prompt)
+            except (EOFError, KeyboardInterrupt):
+                logger.info("shutdown: seed prompt interrupted; treating as cancel")
+                return (None, "cancelled")
+            stripped = raw.strip()
+            if stripped.lower() in _CANCEL_TERMINATORS:
+                return (None, "cancelled")
+            if stripped:
+                return (stripped, "saved")
+            # Empty — reprompt once on attempt 0; fall through on attempt 1.
+            if attempt == 0:
+                attempt_prompt = "Please confirm or cancel."
+        # Fell through both attempts — empty twice.
+        return (None, "empty_twice")
 
     async def _handle_contextual(self, command: Command) -> CommandOutcome:
         """Layer C contextual reply gating.

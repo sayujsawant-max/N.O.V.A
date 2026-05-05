@@ -119,7 +119,7 @@ def test_bare_nova_boots_briefing_then_shuts_down_on_shutdown_command(
     ``test_cli_bootstrap.py`` would patch ``Prompt.ask``; this test
     explicitly does the patch so the assertion that the briefing
     rendered + SHUTDOWN routed is unambiguous.
-    Verify: ``EXIT_OK``, briefing rendered to stdout, ``Session ended.``
+    Verify: ``EXIT_OK``, briefing rendered to stdout, ``Cancelled.``
     rendered, new session row in ``nova.db`` with ``is_complete=1``.
     """
     import asyncio
@@ -135,9 +135,14 @@ def test_bare_nova_boots_briefing_then_shuts_down_on_shutdown_command(
         )
     )
 
-    # Patch the REPL input to type "shutdown" so the loop exits on the
-    # first iteration. End-to-end through every other layer.
-    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: "shutdown")
+    # Patch Prompt.ask: REPL reads "shutdown", then seed prompt reads "skip"
+    # (cancel path) so we don't accidentally write a literal "shutdown" string
+    # as seed_text. Use an iterator with a default fallback for any extra calls.
+    inputs = iter(["shutdown", "skip"])
+    monkeypatch.setattr(
+        "nova.adapters.rich.skin.Prompt.ask",
+        lambda *a, **kw: next(inputs, "skip"),
+    )
 
     exit_code = _invoke_nova(monkeypatch, nova_data_dir)
     assert exit_code == EXIT_OK
@@ -145,8 +150,10 @@ def test_bare_nova_boots_briefing_then_shuts_down_on_shutdown_command(
     # Briefing card rendered (State C — prior session present).
     captured = capsys.readouterr()
     assert "Session Briefing" in captured.out
-    # SHUTDOWN handler ran and rendered confirmation.
-    assert "Session ended." in captured.out
+    # Story 3.7 — Shutdown card + cancel render (skip terminator).
+    assert "Session ending" in captured.out
+    assert "What should you pick up tomorrow?" in captured.out
+    assert "Cancelled." in captured.out
     assert captured.err == ""
 
     # Verify the new session row was written with is_complete=1.
@@ -167,8 +174,174 @@ def test_bare_nova_boots_briefing_then_shuts_down_on_shutdown_command(
     assert len(rows) == 2
     new_session = rows[1]
     assert new_session["mode_name"] is None  # bare nova boot — no mode chosen
-    assert new_session["seed_text"] is None  # Story 3.7 owns seed capture
-    assert new_session["is_complete"] == 1  # SHUTDOWN routed cleanly
+    assert new_session["seed_text"] is None  # Story 3.7 — user typed "skip"
+    assert new_session["is_complete"] == 1  # commit_shutdown finalized cleanly
+
+
+# --- Story 3.7: shutdown with seed entered (end-to-end persistence) --------
+
+
+def test_shutdown_with_seed_persists_session_seed_memory_item_and_snapshot(
+    nova_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Story 3.7 end-to-end — seed entered → 3-row atomic commit + events + render.
+
+    Stdin pipe: ``shutdown`` (REPL) → ``finish auth tests`` (seed prompt).
+    Asserts:
+    * EXIT_OK
+    * Sessions row finalized: is_complete=1, seed_text="finish auth tests"
+    * Memory_items row written: category="seed", content="finish auth tests"
+    * Workspace_snapshots row written: snapshot_type="shutdown"
+    * Audit log has SEED_CAPTURE row with result="success"
+    * stdout contains shutdown card + "Planted for tomorrow."
+    """
+    import asyncio
+
+    inputs = iter(["shutdown", "finish auth tests"])
+    monkeypatch.setattr(
+        "nova.adapters.rich.skin.Prompt.ask",
+        lambda *a, **kw: next(inputs),
+    )
+
+    exit_code = _invoke_nova(monkeypatch, nova_data_dir)
+    assert exit_code == EXIT_OK
+
+    captured = capsys.readouterr()
+    assert "Session ending" in captured.out
+    assert "What should you pick up tomorrow?" in captured.out
+    assert "Planted for tomorrow." in captured.out
+
+    # Verify the three rows landed atomically.
+    storage = SqliteStorageEngine(nova_data_dir / "nova.db")
+
+    async def _read_state() -> dict[str, list[dict[str, object]]]:
+        await storage.start()
+        try:
+            sessions = await storage.fetchall(
+                "SELECT id, seed_text, is_complete FROM sessions ORDER BY id"
+            )
+            memories = await storage.fetchall(
+                "SELECT category, content FROM memory_items ORDER BY id"
+            )
+            snapshots = await storage.fetchall(
+                "SELECT snapshot_type FROM workspace_snapshots ORDER BY id"
+            )
+            audits = await storage.fetchall(
+                "SELECT action_type, result, details FROM audit_log "
+                "WHERE action_type = 'seed_capture' ORDER BY id"
+            )
+            return {
+                "sessions": [dict(r) for r in sessions],
+                "memories": [dict(r) for r in memories],
+                "snapshots": [dict(r) for r in snapshots],
+                "audits": [dict(r) for r in audits],
+            }
+        finally:
+            await storage.close()
+
+    state = asyncio.run(_read_state())
+    assert len(state["sessions"]) == 1
+    sess = state["sessions"][0]
+    assert sess["seed_text"] == "finish auth tests"
+    assert sess["is_complete"] == 1
+    assert len(state["memories"]) == 1
+    mem = state["memories"][0]
+    assert mem["category"] == "seed"
+    assert mem["content"] == "finish auth tests"
+    assert len(state["snapshots"]) == 1
+    snap = state["snapshots"][0]
+    assert snap["snapshot_type"] == "shutdown"
+    assert len(state["audits"]) == 1
+    audit = state["audits"][0]
+    assert audit["result"] == "success"
+
+
+def test_mode_switch_then_shutdown_persists_session_mode_name_and_snapshot_mode(
+    nova_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Story 3.7 review patch — mode coding → shutdown writes both columns.
+
+    The user reported: shutdown captured the active mode in the
+    workspace snapshot but NOT in ``sessions.mode_name``, so
+    ``get_mode_last_used("coding")`` couldn't find the session and
+    ``ModeInfo.last_used_at`` enrichment broke for next-startup
+    briefing assembly.
+
+    This test drives the full flow — ``mode coding`` (mocked launcher
+    so the test runs cross-platform) → ``shutdown`` → seed → assert
+    BOTH ``sessions.mode_name == "coding"`` AND the persisted
+    workspace_snapshots row's mode_name field is ``"coding"``.
+
+    Cross-platform via mocking ``Win32HandsAdapter.launch_app`` to
+    return a synthetic success ``ActionResult``; no real subprocess
+    spawned.
+    """
+    import asyncio
+
+    from nova.adapters.win32.actions import Win32HandsAdapter
+    from nova.core.config import AppConfig
+    from nova.core.types import ActionType
+    from nova.systems.hands.models import ActionResult
+
+    # Mock the launcher's per-app launch primitive so HandsSystem's
+    # orchestration runs end-to-end without spawning real processes.
+    async def fake_launch_app(self: Win32HandsAdapter, app: AppConfig) -> ActionResult:
+        del self
+        return ActionResult(
+            action_type=ActionType.APP_LAUNCH,
+            target=app.name,
+            success=True,
+            reason=None,
+        )
+
+    monkeypatch.setattr(
+        "nova.adapters.win32.actions.Win32HandsAdapter.launch_app",
+        fake_launch_app,
+    )
+
+    inputs = iter(["mode coding", "shutdown", "finish auth tests"])
+    monkeypatch.setattr(
+        "nova.adapters.rich.skin.Prompt.ask",
+        lambda *a, **kw: next(inputs),
+    )
+
+    exit_code = _invoke_nova(monkeypatch, nova_data_dir)
+    assert exit_code == EXIT_OK
+
+    storage = SqliteStorageEngine(nova_data_dir / "nova.db")
+
+    async def _read_state() -> tuple[dict[str, object], dict[str, object]]:
+        await storage.start()
+        try:
+            session_row = await storage.fetchone(
+                "SELECT mode_name, seed_text, is_complete FROM sessions ORDER BY id DESC LIMIT 1"
+            )
+            snapshot_row = await storage.fetchone(
+                "SELECT snapshot_type, workspace_data FROM workspace_snapshots "
+                "ORDER BY id DESC LIMIT 1"
+            )
+            assert session_row is not None
+            assert snapshot_row is not None
+            return dict(session_row), dict(snapshot_row)
+        finally:
+            await storage.close()
+
+    session, snapshot = asyncio.run(_read_state())
+
+    # Sessions row carries the active mode stem so get_mode_last_used
+    # finds it on next startup.
+    assert session["mode_name"] == "coding"
+    assert session["seed_text"] == "finish auth tests"
+    assert session["is_complete"] == 1
+
+    # Workspace snapshot's mode_name field carries the same stem (cross-row consistency).
+    assert snapshot["snapshot_type"] == "shutdown"
+    workspace_data = snapshot["workspace_data"]
+    assert isinstance(workspace_data, str)
+    assert '"mode_name":"coding"' in workspace_data
 
 
 # --- Scenario 2: skip-briefing policy fires for recent prior ---------------
@@ -196,7 +369,11 @@ def test_bare_nova_skips_briefing_when_prior_session_recent(
         )
     )
 
-    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: "shutdown")
+    inputs = iter(["shutdown", "skip"])
+    monkeypatch.setattr(
+        "nova.adapters.rich.skin.Prompt.ask",
+        lambda *a, **kw: next(inputs, "skip"),
+    )
 
     exit_code = _invoke_nova(monkeypatch, nova_data_dir)
     assert exit_code == EXIT_OK
@@ -204,8 +381,9 @@ def test_bare_nova_skips_briefing_when_prior_session_recent(
     captured = capsys.readouterr()
     # Briefing card MUST NOT render — skip policy fired.
     assert "Session Briefing" not in captured.out
-    # SHUTDOWN handler still ran.
-    assert "Session ended." in captured.out
+    # Story 3.7 — Shutdown card + cancel render still run.
+    assert "Session ending" in captured.out
+    assert "Cancelled." in captured.out
 
     # Verify the skip log line is in nova.log.
     log_text = (nova_data_dir / "logs" / "nova.log").read_text(encoding="utf-8")
@@ -326,8 +504,11 @@ def test_mode_restore_full_workspace_ready_end_to_end(
     spawned_pids = _stash_spawned_pids(monkeypatch)
 
     # Iterator-backed Prompt.ask: returns "mode coding" then "shutdown".
-    inputs = iter(["mode coding", "shutdown"])
-    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: next(inputs))
+    inputs = iter(["mode coding", "shutdown", "skip"])
+    monkeypatch.setattr(
+        "nova.adapters.rich.skin.Prompt.ask",
+        lambda *a, **kw: next(inputs, "skip"),
+    )
 
     try:
         exit_code = _invoke_nova(monkeypatch, notepad_mode_data_dir)
@@ -339,7 +520,8 @@ def test_mode_restore_full_workspace_ready_end_to_end(
         # Final-line summary (full success).
         assert "Workspace ready." in captured.out
         # SHUTDOWN handler ran.
-        assert "Session ended." in captured.out
+        # Story 3.7 — shutdown card + cancel render.
+        assert "Cancelled." in captured.out
 
         # Verify the audit log: 1 app_launch/success + 1 mode_restore/success.
         async def _read_audit() -> list[dict[str, object]]:
@@ -390,8 +572,11 @@ def test_mode_restore_partial_failure_workspace_partially_ready(
     )
 
     spawned_pids = _stash_spawned_pids(monkeypatch)
-    inputs = iter(["mode coding", "shutdown"])
-    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: next(inputs))
+    inputs = iter(["mode coding", "shutdown", "skip"])
+    monkeypatch.setattr(
+        "nova.adapters.rich.skin.Prompt.ask",
+        lambda *a, **kw: next(inputs, "skip"),
+    )
 
     try:
         exit_code = _invoke_nova(monkeypatch, notepad_partial_data_dir)
@@ -401,7 +586,8 @@ def test_mode_restore_partial_failure_workspace_partially_ready(
         assert "✓ Notepad" in captured.out
         assert "✗ Bogus XYZ (not found — is it installed?)" in captured.out
         assert "Workspace partially ready. Bogus XYZ was skipped." in captured.out
-        assert "Session ended." in captured.out
+        # Story 3.7 — shutdown card + cancel render.
+        assert "Cancelled." in captured.out
 
         async def _read_audit() -> list[dict[str, object]]:
             storage = SqliteStorageEngine(notepad_partial_data_dir / "nova.db")

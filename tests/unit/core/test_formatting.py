@@ -93,3 +93,60 @@ def test_format_duration_seconds_does_not_encode_interrupted_session_policy() ->
     """
     assert format_duration_seconds(0) == "0s"
     assert format_duration_seconds(0) is not None
+
+
+# ===========================================================================
+# Story 3.7 — diff_iso_seconds (ISO-8601 duration parser)
+# ===========================================================================
+
+
+from nova.core.formatting import diff_iso_seconds  # noqa: E402
+
+
+def test_diff_iso_seconds_returns_positive_seconds_for_valid_range() -> None:
+    """30-minute window → 1800 seconds."""
+    result = diff_iso_seconds(
+        "2026-04-01T10:00:00+00:00",
+        "2026-04-01T10:30:00+00:00",
+    )
+    assert result == 1800
+
+
+def test_diff_iso_seconds_clamps_negative_to_zero() -> None:
+    """Clock skew defense — ended_at < started_at clamps to 0."""
+    result = diff_iso_seconds(
+        "2026-04-01T11:00:00+00:00",
+        "2026-04-01T10:00:00+00:00",
+    )
+    assert result == 0
+
+
+def test_diff_iso_seconds_zero_for_equal_timestamps() -> None:
+    iso = "2026-04-01T10:00:00+00:00"
+    assert diff_iso_seconds(iso, iso) == 0
+
+
+def test_diff_iso_seconds_handles_trailing_z_form() -> None:
+    """Trailing-Z normalization — Python <3.11 compatibility."""
+    result = diff_iso_seconds(
+        "2026-04-01T10:00:00Z",
+        "2026-04-01T10:30:00Z",
+    )
+    assert result == 1800
+
+
+def test_diff_iso_seconds_handles_mixed_z_and_offset_forms() -> None:
+    result = diff_iso_seconds(
+        "2026-04-01T10:00:00Z",
+        "2026-04-01T10:30:00+00:00",
+    )
+    assert result == 1800
+
+
+def test_diff_iso_seconds_returns_integer_not_float() -> None:
+    result = diff_iso_seconds(
+        "2026-04-01T10:00:00.500+00:00",
+        "2026-04-01T10:00:01.500+00:00",
+    )
+    assert isinstance(result, int)
+    assert result == 1

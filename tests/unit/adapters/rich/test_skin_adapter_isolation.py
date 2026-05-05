@@ -11,12 +11,11 @@ Allowed import surface (Story 3.3 AC #29):
 * ``rich.console``, ``rich.panel``, ``rich.text`` — the Rich types this
   adapter uses, pinned to those three modules to prevent accidental
   dependency on ``rich.markdown`` / ``rich.tree`` / etc.
-* ``nova.systems.brain.models`` — ``SessionSummary`` (declared in the
-  ``SkinPort.render_shutdown_card`` signature).
 * ``nova.systems.hands.models`` — ``ActionResult`` (declared in
   ``SkinPort.render_progress``).
 * ``nova.systems.ritual.models`` — ``BriefingViewModel`` (input type
-  for ``render_briefing_card``).
+  for ``render_briefing_card``) AND ``ShutdownViewModel`` (input type
+  for ``render_shutdown_card``, Story 3.7).
 * ``nova.systems.skin.commands`` — ``parse`` function the adapter
   delegates to from ``parse_command`` (Story 3.4).
 * ``nova.systems.skin.models`` — ``Command`` (declared in
@@ -77,7 +76,6 @@ FORBIDDEN_NOVA_PREFIXES: tuple[str, ...] = (
 
 ALLOWED_SYSTEMS_MODELS: frozenset[str] = frozenset(
     {
-        "nova.systems.brain.models",
         "nova.systems.hands.models",
         "nova.systems.ritual.models",
         "nova.systems.skin.commands",
@@ -208,7 +206,6 @@ def test_rich_skin_only_imports_pinned_rich_submodules() -> None:
 @pytest.mark.parametrize(
     "expected_module",
     [
-        "nova.systems.brain.models",
         "nova.systems.hands.models",
         "nova.systems.ritual.models",
         "nova.systems.skin.commands",

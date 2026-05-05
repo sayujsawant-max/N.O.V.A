@@ -2,12 +2,19 @@
 
 Story 1.9 (AC #4) pins two T1 methods: :meth:`RitualPort.build_briefing`
 (consume aggregate, return render-ready view model) and
-:meth:`RitualPort.begin_shutdown` (open the seed-capture flow).
+:meth:`RitualPort.begin_shutdown` (produce a render-ready
+:class:`ShutdownViewModel` from the runtime :class:`ShutdownState`).
 
 Ritual owns ceremony logic; Nerve decides when ceremonies run
-(project-context.md:68). Ritual itself does NOT persist — it orchestrates
-Brain for persistence (``Ritual -> Brain: store_session(...)`` in the T1
-continuity loop). Persistence is BrainPort's surface, not RitualPort's.
+(project-context.md:68). Ritual itself does NOT persist — it produces
+view models from runtime state; Nerve drives Brain for persistence.
+Persistence is BrainPort's surface, not RitualPort's.
+
+Story 3.7 reshape — :meth:`begin_shutdown` signature changes from
+``() -> ShutdownData`` to ``(state: ShutdownState) -> ShutdownViewModel``.
+``ShutdownData`` was a Story 1.9 stub shape (zero callers); the new
+``ShutdownState`` (input DTO) + ``ShutdownViewModel`` (output DTO) pair
+mirrors the briefing pattern's pre-rendered-labels approach.
 
 Port rules (architecture.md:948-986):
 
@@ -23,7 +30,7 @@ from typing import Protocol
 
 from nova.core.types import BriefingState, CapabilityTier
 from nova.systems.brain.models import BriefingAggregate
-from nova.systems.ritual.models import BriefingViewModel, ShutdownData
+from nova.systems.ritual.models import BriefingViewModel, ShutdownState, ShutdownViewModel
 
 
 class RitualPort(Protocol):
@@ -36,7 +43,7 @@ class RitualPort(Protocol):
         tier: CapabilityTier,
     ) -> BriefingViewModel: ...
 
-    async def begin_shutdown(self) -> ShutdownData: ...
+    async def begin_shutdown(self, state: ShutdownState) -> ShutdownViewModel: ...
 
 
 __all__: list[str] = [

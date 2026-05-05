@@ -7,19 +7,23 @@ must NOT touch ``rich`` / ``sqlite3`` / Win32 / Anthropic at any scope,
 and must NOT reach upward into ``nova.app`` / ``nova.cli`` /
 ``nova.setup``.
 
-Allowed import surface (Story 3.5 AC #36):
+Allowed import surface (Story 3.5 AC #36, extended in Story 3.7):
 
 * stdlib (``__future__``, ``asyncio``, ``contextlib``, ``logging``,
-  ``signal``, ``sys``, ``collections.abc``, ``datetime``)
-* ``nova.core.*`` — ``config`` (``NovaConfig`` / ``UserSettings``),
-  ``events`` (``EventBus``, ``SessionStarted``, ``SessionEnded``),
-  ``tiers`` (``TierManager``), ``types`` (``BriefingState``,
-  ``CapabilityTier``)
-* ``nova.ports.{brain,ritual,skin}`` — ports the orchestrator consumes
+  ``signal``, ``sys``, ``collections.abc``, ``datetime``, ``typing``)
+* ``nova.core.*`` — ``audit`` (``AuditLogger``, ``RESULT_*`` constants —
+  Story 3.7), ``config`` (``NovaConfig`` / ``UserSettings``), ``events``
+  (``EventBus``, ``SessionStarted``, ``SessionEnded``, ``SeedSaved``),
+  ``formatting`` (``diff_iso_seconds``, ``format_duration_seconds`` —
+  Story 3.7), ``tiers`` (``TierManager``), ``types`` (``BriefingState``,
+  ``CapabilityTier``, ``ActionType``)
+* ``nova.ports.{brain,hands,ritual,skin}`` — ports the orchestrator consumes
 * ``nova.systems.brain.models`` — cross-system model surface
-  (``SessionSummary``, Story 1.9 AC #8)
+  (``SessionSummary``, ``ShutdownCommit`` — Story 1.9 AC #8)
 * ``nova.systems.nerve.briefing`` — Nerve-internal briefing assembly
 * ``nova.systems.nerve.models`` — Nerve-internal ``CommandOutcome``
+* ``nova.systems.ritual.models`` — cross-system model surface
+  (``ShutdownState`` — Story 3.7; mirrors the brain.models precedent)
 * ``nova.systems.skin.models`` — cross-system ``Command`` / ``CommandVerb``
 
 Mirrors the shape of ``test_briefing_isolation.py`` so a future
@@ -75,6 +79,7 @@ ALLOWED_NOVA_SYSTEMS: frozenset[str] = frozenset(
     {
         # Cross-system models (Story 1.9 AC #8).
         "nova.systems.brain.models",
+        "nova.systems.ritual.models",
         "nova.systems.skin.models",
         # Nerve-internal modules (sibling files).
         "nova.systems.nerve.briefing",
@@ -194,16 +199,21 @@ def test_nerve_system_no_dynamic_forbidden_imports(module: ModuleType) -> None:
 # Positive-presence parametrize per AC #36 — drops would silently break
 # Nerve so we early-warn here rather than at runtime.
 _EXPECTED_NOVA_IMPORTS: tuple[str, ...] = (
+    "nova.core",
+    "nova.core.audit",
     "nova.core.config",
     "nova.core.events",
+    "nova.core.formatting",
     "nova.core.tiers",
     "nova.core.types",
     "nova.ports.brain",
+    "nova.ports.hands",
     "nova.ports.ritual",
     "nova.ports.skin",
     "nova.systems.brain.models",
     "nova.systems.nerve.briefing",
     "nova.systems.nerve.models",
+    "nova.systems.ritual.models",
     "nova.systems.skin.models",
 )
 

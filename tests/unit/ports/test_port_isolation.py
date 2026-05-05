@@ -96,6 +96,10 @@ PORT_CONTRACT: dict[ModuleType, tuple[str, tuple[str, ...]]] = {
             # replaces the Story 1.9 stub's aggregate methods.
             "create_session",
             "end_session",
+            # Story 3.7 addition — atomic three-write shutdown commit
+            # (sessions UPDATE + memory_items INSERT when seed entered +
+            # workspace_snapshots INSERT) inside engine.transaction().
+            "commit_shutdown",
             "get_last_session",
             "get_last_seed",
             "store_snapshot",

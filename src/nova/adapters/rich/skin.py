@@ -8,9 +8,11 @@ Briefing Card Panel surface). Story 3.4 ships :meth:`parse_command`
 :meth:`collect_input` and :meth:`render_response` (the REPL primitives
 the :class:`~nova.systems.nerve.system.NerveSystem` loop consumes).
 Story 3.6 ships :meth:`render_progress` per-app inline (single
-:class:`ActionResult` per call, NOT a batch). Tree (transparency,
-Epic 5) and the Shutdown Card (Story 3.7) land in their respective
-stories.
+:class:`ActionResult` per call, NOT a batch). Story 3.7 ships
+:meth:`render_shutdown_card` — yellow-bordered Rich Panel with
+pre-rendered labels (mirrors the briefing-card structure with a
+distinct chrome color). Tree (transparency, Epic 5) lands in its
+own story.
 
 The :data:`REASON_NOT_FOUND` import from :mod:`nova.ports.app_launcher`
 is the canonical reason-vocabulary owner — importing from the port
@@ -66,9 +68,8 @@ from rich.prompt import Prompt
 from rich.text import Text
 
 from nova.ports.app_launcher import REASON_NOT_FOUND
-from nova.systems.brain.models import SessionSummary
 from nova.systems.hands.models import ActionResult
-from nova.systems.ritual.models import BriefingViewModel
+from nova.systems.ritual.models import BriefingViewModel, ShutdownViewModel
 from nova.systems.skin.commands import parse
 from nova.systems.skin.models import Command
 
@@ -193,8 +194,60 @@ class RichSkinAdapter:
             line = f"✗ {result.target} ({result.reason})"
         await asyncio.to_thread(self._console.print, line, markup=False)
 
-    async def render_shutdown_card(self, summary: SessionSummary) -> None:
-        raise NotImplementedError("Story 3.7 scope")
+    async def render_shutdown_card(self, view_model: ShutdownViewModel) -> None:
+        """Render the Shutdown Card as a yellow Rich Panel.
+
+        Yellow border distinguishes shutdown from the briefing card's
+        cyan chrome at a glance — same panel structure, different
+        visual signal.
+
+        Layout (block-grouped lines with progressive omission):
+        ::
+
+            ┌─ Session ending ──────────────────────┐
+            │                                       │
+            │   Mode: Coding                        │
+            │   Duration: 1h 23m                    │
+            │   Apps: VS Code, Postman              │
+            │                                       │
+            │   What should you pick up tomorrow?   │
+            │                                       │
+            └───────────────────────────────────────┘
+
+        Block layout — meta-block (Mode/Duration/Apps tight grouped) +
+        prompt-block (separated by a blank line). Progressive
+        omission per the briefing pattern: ``mode_label`` and
+        ``apps_label`` are skipped when ``None``; ``duration_label``
+        is always present. Markup-safe :meth:`Text.append` (NOT raw
+        markup-string concatenation) so user-controlled mode names
+        cannot inject Rich markup.
+        """
+        body = Text()
+        previous_block: str | None = None
+
+        def _emit(text: str, style: str, block: str) -> None:
+            nonlocal previous_block
+            if previous_block is not None:
+                body.append("\n\n" if previous_block != block else "\n")
+            body.append(text, style=style)
+            previous_block = block
+
+        if view_model.mode_label is not None:
+            _emit(view_model.mode_label, "dim", "meta")
+        _emit(view_model.duration_label, "dim", "meta")
+        if view_model.apps_label is not None:
+            _emit(view_model.apps_label, "dim", "meta")
+
+        _emit(view_model.prompt_text, "bold bright_white", "prompt")
+
+        title = Text(view_model.title, style="bold yellow")
+        panel = Panel(
+            body,
+            title=title,
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        self._console.print(panel)
 
     async def render_response(self, text: str) -> None:
         """Plain-line operational output — no panel, no markup, no Voice (Story 3.5).

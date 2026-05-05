@@ -786,3 +786,567 @@ async def test_get_mode_last_used_returns_none_for_empty_string_mode_name(
     await adapter.create_session(mode_name="coding", started_at="2026-04-21T10:00:00+00:00")
 
     assert await adapter.get_mode_last_used("") is None
+
+
+# ===========================================================================
+# Story 3.7 — commit_shutdown (atomic three-write transactional commit)
+# ===========================================================================
+
+
+async def test_commit_shutdown_writes_all_three_rows_atomically(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Story 3.7 — sessions UPDATE + memory_items INSERT + workspace_snapshots INSERT."""
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name="coding", started_at="2026-04-01T10:00:00+00:00")
+    commit = ShutdownCommit(
+        seed_text="finish auth tests",
+        summary="Coding mode, 30m",
+        snapshot_apps=("VS Code", "Postman"),
+        snapshot_focused_app=None,
+        snapshot_mode_name="coding",
+    )
+    ended_at = await adapter.commit_shutdown(sid, commit)
+    sess = await engine.fetchone(
+        "SELECT seed_text, summary, is_complete, ended_at FROM sessions WHERE id = ?",
+        (sid,),
+    )
+    assert sess is not None
+    assert sess["seed_text"] == "finish auth tests"
+    assert sess["summary"] == "Coding mode, 30m"
+    assert sess["is_complete"] == 1
+    assert sess["ended_at"] == ended_at
+    mem = await engine.fetchone(
+        "SELECT category, content, created_at FROM memory_items WHERE session_id = ?",
+        (sid,),
+    )
+    assert mem is not None
+    assert mem["category"] == "seed"
+    assert mem["content"] == "finish auth tests"
+    assert mem["created_at"] == ended_at
+    snap = await engine.fetchone(
+        "SELECT snapshot_type, captured_at, workspace_data FROM workspace_snapshots "
+        "WHERE session_id = ?",
+        (sid,),
+    )
+    assert snap is not None
+    assert snap["snapshot_type"] == "shutdown"
+    assert snap["captured_at"] == ended_at
+
+
+async def test_commit_shutdown_skips_memory_items_when_seed_text_is_none(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text=None,
+            summary=None,
+            snapshot_apps=(),
+            snapshot_focused_app=None,
+            snapshot_mode_name=None,
+        ),
+    )
+    sess = await engine.fetchone("SELECT seed_text, is_complete FROM sessions WHERE id = ?", (sid,))
+    assert sess is not None
+    assert sess["seed_text"] is None
+    assert sess["is_complete"] == 1
+    mem_count = await engine.fetchone(
+        "SELECT COUNT(*) AS n FROM memory_items WHERE session_id = ?", (sid,)
+    )
+    assert mem_count is not None and mem_count["n"] == 0
+    snap_count = await engine.fetchone(
+        "SELECT COUNT(*) AS n FROM workspace_snapshots WHERE session_id = ?", (sid,)
+    )
+    assert snap_count is not None and snap_count["n"] == 1
+
+
+async def test_commit_shutdown_writes_session_mode_name_for_get_mode_last_used_lookup(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Story 3.7 review patch — sessions.mode_name lands at shutdown.
+
+    ``startup()`` creates the session with ``mode_name=None``; mode
+    switches during the session do NOT update the column. Shutdown is
+    the natural durable boundary where the active mode lands so the
+    next session's ``get_mode_last_used("coding")`` (Story 3.2)
+    enriches ``ModeInfo.last_used_at``.
+    """
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text="finish auth tests",
+            summary="Coding mode, 30m",
+            snapshot_apps=("VS Code",),
+            snapshot_focused_app=None,
+            snapshot_mode_name="coding",
+        ),
+    )
+    sess = await engine.fetchone("SELECT mode_name FROM sessions WHERE id = ?", (sid,))
+    assert sess is not None
+    assert sess["mode_name"] == "coding"
+    # And get_mode_last_used resolves it.
+    started_at = await adapter.get_mode_last_used("coding")
+    assert started_at == "2026-04-01T10:00:00+00:00"
+
+
+async def test_commit_shutdown_with_no_active_mode_keeps_session_mode_name_null(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Bare-boot shutdown (no mode active) leaves sessions.mode_name as NULL."""
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text=None,
+            summary=None,
+            snapshot_apps=(),
+            snapshot_focused_app=None,
+            snapshot_mode_name=None,
+        ),
+    )
+    sess = await engine.fetchone("SELECT mode_name FROM sessions WHERE id = ?", (sid,))
+    assert sess is not None
+    assert sess["mode_name"] is None
+
+
+async def test_commit_shutdown_normalizes_empty_string_seed_to_null_and_skips_memory_item(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Adapter defense — ``seed_text=""`` is treated as "no seed" for BOTH writes.
+
+    Nerve's ``_collect_seed_with_reprompt`` strips and rejects whitespace-only
+    inputs, so ``""`` only ever reaches commit_shutdown via a future caller
+    that bypasses Nerve. The adapter normalizes to keep the two writes
+    consistent: sessions.seed_text=NULL AND zero memory_items rows.
+    """
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text="",
+            summary=None,
+            snapshot_apps=(),
+            snapshot_focused_app=None,
+            snapshot_mode_name=None,
+        ),
+    )
+    sess = await engine.fetchone("SELECT seed_text FROM sessions WHERE id = ?", (sid,))
+    assert sess is not None
+    assert sess["seed_text"] is None  # normalized to NULL, NOT empty string
+    mem_count = await engine.fetchone(
+        "SELECT COUNT(*) AS n FROM memory_items WHERE session_id = ?", (sid,)
+    )
+    assert mem_count is not None and mem_count["n"] == 0
+
+
+async def test_commit_shutdown_uses_same_ended_at_across_all_three_rows(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Story 3.7 — single source of truth for the timestamp."""
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name="coding", started_at="2026-04-01T10:00:00+00:00")
+    ended_at = await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text="x",
+            summary="x",
+            snapshot_apps=("a",),
+            snapshot_focused_app=None,
+            snapshot_mode_name="coding",
+        ),
+    )
+    sess_row = await engine.fetchone("SELECT ended_at FROM sessions WHERE id = ?", (sid,))
+    mem_row = await engine.fetchone(
+        "SELECT created_at FROM memory_items WHERE session_id = ?", (sid,)
+    )
+    snap_row = await engine.fetchone(
+        "SELECT captured_at FROM workspace_snapshots WHERE session_id = ?", (sid,)
+    )
+    assert sess_row is not None
+    assert mem_row is not None
+    assert snap_row is not None
+    assert sess_row["ended_at"] == mem_row["created_at"] == snap_row["captured_at"] == ended_at
+
+
+async def test_commit_shutdown_persists_seed_category_as_string(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name="coding", started_at="2026-04-01T10:00:00+00:00")
+    await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text="x",
+            summary=None,
+            snapshot_apps=(),
+            snapshot_focused_app=None,
+            snapshot_mode_name=None,
+        ),
+    )
+    row = await engine.fetchone("SELECT category FROM memory_items WHERE session_id = ?", (sid,))
+    assert row is not None and row["category"] == "seed"
+
+
+async def test_commit_shutdown_persists_apps_via_workspace_data_json(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """JSON shape locked to Story 2.4 / Story 3.1 — byte-exact."""
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name="coding", started_at="2026-04-01T10:00:00+00:00")
+    await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text=None,
+            summary=None,
+            snapshot_apps=("VS Code", "Postman"),
+            snapshot_focused_app=None,
+            snapshot_mode_name=None,
+        ),
+    )
+    row = await engine.fetchone(
+        "SELECT workspace_data FROM workspace_snapshots WHERE session_id = ?", (sid,)
+    )
+    assert row is not None
+    expected = '{"apps":["VS Code","Postman"],"focused_app":null,"mode_name":null}'
+    assert row["workspace_data"] == expected
+
+
+async def test_commit_shutdown_logger_does_not_emit_content(
+    adapter: SqliteBrainAdapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sensitive content (seed text, app names) MUST NOT appear in logs."""
+    import logging
+
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name="coding", started_at="2026-04-01T10:00:00+00:00")
+    secret_seed = "private-tomorrow-thought-12345"
+    with caplog.at_level(logging.DEBUG, logger="nova.adapters.sqlite.brain"):
+        await adapter.commit_shutdown(
+            sid,
+            ShutdownCommit(
+                seed_text=secret_seed,
+                summary=None,
+                snapshot_apps=("SecretApp123",),
+                snapshot_focused_app=None,
+                snapshot_mode_name=None,
+            ),
+        )
+    log_text = " ".join(r.message for r in caplog.records)
+    assert secret_seed not in log_text
+    assert "SecretApp123" not in log_text
+
+
+async def test_commit_shutdown_returns_stamped_ended_at(
+    adapter: SqliteBrainAdapter,
+) -> None:
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    ended_at = await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text=None,
+            summary=None,
+            snapshot_apps=(),
+            snapshot_focused_app=None,
+            snapshot_mode_name=None,
+        ),
+    )
+    assert isinstance(ended_at, str)
+    assert "T" in ended_at  # ISO-8601 shape (defensive)
+
+
+async def test_commit_shutdown_raises_storage_error_when_session_does_not_exist(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Pre-write SELECT — a missing session_id is a programmer error.
+
+    Surfaces loudly via :class:`StorageError` rather than silently
+    inserting orphan memory_items / workspace_snapshots rows whose
+    foreign keys would dangle.
+    """
+    from nova.systems.brain.models import ShutdownCommit
+
+    bogus_session_id = 99999
+    with pytest.raises(StorageError, match="session_id=99999"):
+        await adapter.commit_shutdown(
+            bogus_session_id,
+            ShutdownCommit(
+                seed_text="x",
+                summary=None,
+                snapshot_apps=("y",),
+                snapshot_focused_app=None,
+                snapshot_mode_name=None,
+            ),
+        )
+
+    # No orphan rows landed.
+    mem_count = await engine.fetchone(
+        "SELECT COUNT(*) AS n FROM memory_items WHERE session_id = ?", (bogus_session_id,)
+    )
+    assert mem_count is not None and mem_count["n"] == 0
+    snap_count = await engine.fetchone(
+        "SELECT COUNT(*) AS n FROM workspace_snapshots WHERE session_id = ?", (bogus_session_id,)
+    )
+    assert snap_count is not None and snap_count["n"] == 0
+
+
+async def test_commit_shutdown_re_called_on_completed_session_skips_all_writes(
+    engine: SqliteStorageEngine,
+    adapter: SqliteBrainAdapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Idempotency — re-call must NOT create duplicate seed memory or snapshot rows.
+
+    First commit_shutdown finalizes the session; re-call returns the
+    existing ended_at and SKIPS all three writes. The post-condition
+    checks: sessions row unchanged, exactly ONE memory_items row,
+    exactly ONE workspace_snapshots row.
+    """
+    import logging
+
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name="coding", started_at="2026-04-01T10:00:00+00:00")
+    first_commit = ShutdownCommit(
+        seed_text="first seed",
+        summary="first summary",
+        snapshot_apps=("FirstApp",),
+        snapshot_focused_app=None,
+        snapshot_mode_name="coding",
+    )
+    first_ended_at = await adapter.commit_shutdown(sid, first_commit)
+
+    # Second call with DIFFERENT inputs — the impl must ignore them and
+    # return the existing ended_at; no new rows MAY land.
+    second_commit = ShutdownCommit(
+        seed_text="second seed",
+        summary="second summary",
+        snapshot_apps=("SecondApp",),
+        snapshot_focused_app=None,
+        snapshot_mode_name="coding",
+    )
+    with caplog.at_level(logging.WARNING, logger="nova.adapters.sqlite.brain"):
+        second_ended_at = await adapter.commit_shutdown(sid, second_commit)
+
+    assert second_ended_at == first_ended_at
+
+    # Sessions row carries the FIRST commit's data; not overwritten.
+    sess = await engine.fetchone(
+        "SELECT seed_text, summary, ended_at FROM sessions WHERE id = ?", (sid,)
+    )
+    assert sess is not None
+    assert sess["seed_text"] == "first seed"
+    assert sess["summary"] == "first summary"
+    assert sess["ended_at"] == first_ended_at
+
+    # Exactly ONE memory_items row (the first call's), NOT two.
+    mems = await engine.fetchall("SELECT content FROM memory_items WHERE session_id = ?", (sid,))
+    assert len(mems) == 1
+    assert mems[0]["content"] == "first seed"
+
+    # Exactly ONE workspace_snapshots row, with the first call's apps.
+    snaps = await engine.fetchall(
+        "SELECT workspace_data FROM workspace_snapshots WHERE session_id = ?", (sid,)
+    )
+    assert len(snaps) == 1
+    assert "FirstApp" in snaps[0]["workspace_data"]
+    assert "SecondApp" not in snaps[0]["workspace_data"]
+
+    # WARNING fired about the no-op re-call.
+    assert any("already-completed" in r.message for r in caplog.records)
+
+
+async def test_commit_shutdown_re_called_with_no_seed_skips_all_writes(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Idempotency on the cancel-then-re-call sequence.
+
+    Even if the first commit had ``seed_text=None`` (cancel path) and
+    the second call provides a seed, the second call must still SKIP
+    all writes — the row is already finalized.
+    """
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text=None,
+            summary=None,
+            snapshot_apps=(),
+            snapshot_focused_app=None,
+            snapshot_mode_name=None,
+        ),
+    )
+    # Re-call WITH a seed — must skip the memory_items INSERT.
+    await adapter.commit_shutdown(
+        sid,
+        ShutdownCommit(
+            seed_text="late seed attempt",
+            summary=None,
+            snapshot_apps=(),
+            snapshot_focused_app=None,
+            snapshot_mode_name=None,
+        ),
+    )
+    # Zero memory_items rows because the second call short-circuited.
+    mem_count = await engine.fetchone(
+        "SELECT COUNT(*) AS n FROM memory_items WHERE session_id = ?", (sid,)
+    )
+    assert mem_count is not None and mem_count["n"] == 0
+
+
+async def test_commit_shutdown_rolls_back_when_mid_transaction_failure(
+    engine: SqliteStorageEngine,
+    adapter: SqliteBrainAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Atomicity — a real mid-transaction failure rolls back ALL three writes.
+
+    Inject a failure into ``_serialize_workspace_data`` (called between
+    the memory_items INSERT and the workspace_snapshots INSERT) so the
+    third write never fires; the previous two writes must roll back.
+    """
+    from nova.systems.brain.models import ShutdownCommit
+
+    sid = await adapter.create_session(mode_name="coding", started_at="2026-04-01T10:00:00+00:00")
+
+    # Explicit signature mirrors the production helper (apps + focused_app
+    # + mode_name keyword-only). A future refactor that switches to
+    # positional args at the call site would surface here as a TypeError
+    # rather than silently passing through a permissive ``**kwargs``.
+    def boom(
+        *,
+        apps: tuple[str, ...],
+        focused_app: str | None,
+        mode_name: str | None,
+    ) -> str:
+        del apps, focused_app, mode_name
+        raise RuntimeError("simulated mid-transaction serializer failure")
+
+    monkeypatch.setattr("nova.adapters.sqlite.brain._serialize_workspace_data", boom)
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        await adapter.commit_shutdown(
+            sid,
+            ShutdownCommit(
+                seed_text="rolled-back seed",
+                summary="rolled-back summary",
+                snapshot_apps=("a",),
+                snapshot_focused_app=None,
+                snapshot_mode_name="coding",
+            ),
+        )
+
+    # All three writes rolled back: sessions still incomplete, no
+    # memory_items row, no workspace_snapshots row.
+    sess = await engine.fetchone("SELECT is_complete, seed_text FROM sessions WHERE id = ?", (sid,))
+    assert sess is not None
+    assert sess["is_complete"] == 0
+    assert sess["seed_text"] is None
+    mem_count = await engine.fetchone(
+        "SELECT COUNT(*) AS n FROM memory_items WHERE session_id = ?", (sid,)
+    )
+    assert mem_count is not None and mem_count["n"] == 0
+    snap_count = await engine.fetchone(
+        "SELECT COUNT(*) AS n FROM workspace_snapshots WHERE session_id = ?", (sid,)
+    )
+    assert snap_count is not None and snap_count["n"] == 0
+
+
+# ===========================================================================
+# Story 3.7 — end_session idempotency guard (closes deferred-work.md:231)
+# ===========================================================================
+
+
+async def test_end_session_re_called_on_completed_session_returns_existing_ended_at(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """Idempotency guard — second call does not overwrite seed/summary/ended_at."""
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    first_ended_at = await adapter.end_session(
+        sid, seed_text="first", summary="first", is_complete=True
+    )
+    second_ended_at = await adapter.end_session(
+        sid, seed_text="second", summary="second", is_complete=True
+    )
+    assert first_ended_at == second_ended_at
+    row = await engine.fetchone(
+        "SELECT seed_text, summary, ended_at FROM sessions WHERE id = ?", (sid,)
+    )
+    assert row is not None
+    assert row["seed_text"] == "first"  # NO overwrite
+    assert row["summary"] == "first"
+    assert row["ended_at"] == first_ended_at
+
+
+async def test_end_session_re_called_logs_warning_about_no_op(
+    adapter: SqliteBrainAdapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    await adapter.end_session(sid, seed_text="first", summary=None, is_complete=True)
+    with caplog.at_level(logging.WARNING, logger="nova.adapters.sqlite.brain"):
+        await adapter.end_session(sid, seed_text="second", summary=None, is_complete=True)
+    assert any("already-completed" in r.message for r in caplog.records)
+
+
+async def test_end_session_first_call_on_incomplete_row_proceeds_normally(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    ended_at = await adapter.end_session(sid, seed_text="seed", summary="summary", is_complete=True)
+    row = await engine.fetchone(
+        "SELECT seed_text, summary, is_complete, ended_at FROM sessions WHERE id = ?",
+        (sid,),
+    )
+    assert row is not None
+    assert row["seed_text"] == "seed"
+    assert row["summary"] == "summary"
+    assert row["is_complete"] == 1
+    assert row["ended_at"] == ended_at
+
+
+async def test_end_session_with_is_complete_false_can_be_called_multiple_times(
+    engine: SqliteStorageEngine, adapter: SqliteBrainAdapter
+) -> None:
+    """The idempotency filter only blocks RE-completion (1→1); is_complete=False stays writable."""
+    sid = await adapter.create_session(mode_name=None, started_at="2026-04-01T10:00:00+00:00")
+    first = await adapter.end_session(sid, seed_text=None, summary=None, is_complete=False)
+    second = await adapter.end_session(sid, seed_text=None, summary=None, is_complete=False)
+    row = await engine.fetchone("SELECT is_complete FROM sessions WHERE id = ?", (sid,))
+    assert row is not None and row["is_complete"] == 0
+    assert first
+    assert second
+
+
+async def test_end_session_zero_rows_match_logs_warning_and_returns_iso(
+    adapter: SqliteBrainAdapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="nova.adapters.sqlite.brain"):
+        ended_at = await adapter.end_session(99999, seed_text=None, summary=None, is_complete=True)
+    assert isinstance(ended_at, str) and "T" in ended_at
+    assert any("matched zero rows" in r.message for r in caplog.records)

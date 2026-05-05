@@ -116,6 +116,48 @@ class MemoryItem:
 
 
 @dataclass(frozen=True)
+class ShutdownCommit:
+    """Atomic input to ``BrainPort.commit_shutdown`` (Story 3.7).
+
+    Carries everything needed to finalize a session in one
+    transactional write:
+
+    * ``seed_text`` / ``summary`` — written to the ``sessions`` row
+      columns of the same name. ``seed_text`` controls whether the
+      memory_items INSERT happens (``None`` → skipped).
+    * ``snapshot_apps`` / ``snapshot_focused_app`` /
+      ``snapshot_mode_name`` — written to the ``workspace_snapshots``
+      row's ``workspace_data`` JSON. ``snapshot_type`` is implied
+      (always ``SnapshotType.SHUTDOWN`` — this DTO is shutdown-
+      specific).
+
+    **No timestamp fields.** The adapter stamps ``ended_at`` once
+    inside the transaction and uses the SAME value for the
+    ``sessions.ended_at`` column, the ``memory_items.created_at``
+    column (when seed entered), and the
+    ``workspace_snapshots.captured_at`` column. Caller-supplied
+    timestamps would create cross-row drift; the adapter is the
+    single source of truth.
+
+    Mirrors ``WorkspaceSnapshotInput``'s typed-input pattern — no
+    raw ``dict`` crosses the port boundary (Story 1.9 AC #5). All
+    sequence fields are ``tuple[str, ...]`` for genuine immutability
+    under ``frozen=True``.
+
+    ``snapshot_apps`` is the active mode's launched-apps tuple
+    (display names) — same source as the shutdown card's apps
+    label, so the durable snapshot row matches what the user
+    saw on screen.
+    """
+
+    seed_text: str | None
+    summary: str | None
+    snapshot_apps: tuple[str, ...]
+    snapshot_focused_app: str | None
+    snapshot_mode_name: str | None
+
+
+@dataclass(frozen=True)
 class ModeInfo:
     """Brain-layer mode projection: canonical stem + display label + usage metadata.
 
@@ -235,6 +277,7 @@ __all__: list[str] = [
     "MemoryItem",
     "ModeInfo",
     "SessionSummary",
+    "ShutdownCommit",
     "TransparencyModel",
     "WorkspaceSnapshotInput",
 ]

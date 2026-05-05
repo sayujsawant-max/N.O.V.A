@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nova.core.audit import AuditLogger
 from nova.core.config import (
     AppConfig,
     ExclusionConfig,
@@ -32,7 +33,7 @@ from nova.core.config import (
     NovaConfig,
     UserSettings,
 )
-from nova.core.events import EventBus, SessionEnded, SessionStarted
+from nova.core.events import EventBus, SeedSaved, SessionEnded, SessionStarted
 from nova.core.exceptions import StorageError
 from nova.core.tiers import TierManager
 from nova.core.types import ActionType, BriefingState, CapabilityTier
@@ -44,7 +45,7 @@ from nova.systems.brain.models import (
 from nova.systems.hands.models import ActionResult
 from nova.systems.nerve.models import CommandOutcome
 from nova.systems.nerve.system import NerveSystem, _should_skip_briefing
-from nova.systems.ritual.models import BriefingViewModel
+from nova.systems.ritual.models import BriefingViewModel, ShutdownViewModel
 from nova.systems.skin.models import Command, CommandVerb
 
 # ---------------------------------------------------------------------------
@@ -174,10 +175,19 @@ def _make_brain_mock(
     last_session: SessionSummary | None = None,
     last_seed: str | None = None,
 ) -> MagicMock:
-    """Build a Brain port mock that satisfies load_briefing_aggregate + lifecycle calls."""
+    """Build a Brain port mock that satisfies load_briefing_aggregate + lifecycle calls.
+
+    ``end_session`` and ``commit_shutdown`` return DISTINCT sentinel
+    timestamps so a regression that accidentally swapped which method
+    is called from the production path would produce a different
+    asserted timestamp and trip the test. Identical sentinels would
+    let the swap pass silently.
+    """
     brain = MagicMock(name="brain")
     brain.create_session = AsyncMock(return_value=session_id)
     brain.end_session = AsyncMock(return_value="2026-04-01T11:00:00+00:00")
+    brain.commit_shutdown = AsyncMock(return_value="2026-04-01T11:30:00+00:00")
+    brain.store_snapshot = AsyncMock(return_value=None)
     brain.get_last_session = AsyncMock(return_value=last_session)
     brain.get_last_seed = AsyncMock(return_value=last_seed)
     brain.get_last_snapshot_for_session = AsyncMock(return_value=None)
@@ -185,10 +195,29 @@ def _make_brain_mock(
     return brain
 
 
+def _make_audit_mock() -> MagicMock:
+    """Build an AuditLogger-spec'd mock with ``log_action`` as AsyncMock."""
+    audit = MagicMock(spec=AuditLogger)
+    audit.log_action = AsyncMock(return_value=None)
+    return audit
+
+
 def _make_ritual_mock(view_model: BriefingViewModel | None = None) -> MagicMock:
     ritual = MagicMock(name="ritual")
     ritual.build_briefing = AsyncMock(
         return_value=view_model if view_model is not None else _state_c_view_model()
+    )
+    # Story 3.7 — begin_shutdown is reshaped to (state) -> ShutdownViewModel.
+    # Default returns a stub view model with the locked T1 prompt text.
+    ritual.begin_shutdown = AsyncMock(
+        return_value=ShutdownViewModel(
+            session_id=42,
+            title="Session ending",
+            mode_label=None,
+            duration_label="Duration: 0s",
+            apps_label=None,
+            prompt_text="What should you pick up tomorrow?",
+        )
     )
     return ritual
 
@@ -198,10 +227,17 @@ def _make_skin_mock(
     inputs: list[str] | None = None,
     parse_side_effect: Any = None,
 ) -> MagicMock:
+    """Build a Skin port mock.
+
+    Default ``inputs`` is ``["shutdown", "skip"]`` — the REPL reads
+    "shutdown" (command) and Story 3.7's seed prompt reads "skip"
+    (cancel). Tests that need other shapes pass an explicit list.
+    """
     skin = MagicMock(name="skin")
     skin.render_briefing_card = AsyncMock(return_value=None)
+    skin.render_shutdown_card = AsyncMock(return_value=None)
     skin.render_response = AsyncMock(return_value=None)
-    inputs_iter = iter(inputs if inputs is not None else ["shutdown"])
+    inputs_iter = iter(inputs if inputs is not None else ["shutdown", "skip"])
     skin.collect_input = AsyncMock(side_effect=lambda prompt: next(inputs_iter))
 
     if parse_side_effect is not None:
@@ -263,6 +299,7 @@ def _build_nerve_system(
     tier_manager: MagicMock | None = None,
     config: NovaConfig | None = None,
     hands: MagicMock | None = None,
+    audit: MagicMock | None = None,
     clock: Any = None,
 ) -> NerveSystem:
     fixed_clock = (
@@ -276,6 +313,7 @@ def _build_nerve_system(
         tier_manager=tier_manager if tier_manager is not None else _make_tier_manager_mock(),
         config=config if config is not None else _config(modes={"coding": _mode("coding")}),
         hands=hands if hands is not None else _make_hands_mock(),
+        audit=audit if audit is not None else _make_audit_mock(),
         clock=fixed_clock,
     )
 
@@ -308,7 +346,7 @@ def test_constructor_does_not_create_shutdown_event() -> None:
 @pytest.mark.asyncio
 async def test_startup_creates_shutdown_event_lazily() -> None:
     """``_shutdown_event`` is created INSIDE startup, not in ``__init__``."""
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(skin=skin)
     await nerve.startup()
     assert nerve._shutdown_event is not None
@@ -323,7 +361,7 @@ async def test_startup_reads_prior_state_before_creating_session() -> None:
     to shadow the prior-session reads, breaking State A/B/C determination.
     """
     brain = _make_brain_mock()
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(brain=brain, skin=skin)
     await nerve.startup()
     method_names = [call_obj[0] for call_obj in brain.method_calls]
@@ -403,7 +441,7 @@ async def test_startup_creates_session_after_briefing_render() -> None:
         last_seed="seed",
     )
     ritual = _make_ritual_mock(view_model=_state_c_view_model())
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     event_bus = _make_event_bus_mock()
     nerve = _build_nerve_system(
         brain=brain,
@@ -437,7 +475,7 @@ async def test_startup_persist_before_emit_session_started() -> None:
     """
     brain = _make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x")
     event_bus = _make_event_bus_mock()
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     # Capture call order across two mocks via a side-effect counter.
     counter: list[str] = []
 
@@ -475,10 +513,16 @@ async def test_startup_persist_before_emit_session_started() -> None:
 
 
 @pytest.mark.asyncio
-async def test_startup_passes_mode_name_none_to_create_session() -> None:
-    """``mode_name=None, started_at=None`` — adapter stamps timestamp."""
+async def test_startup_passes_mode_name_none_with_caller_stamped_started_at() -> None:
+    """Story 3.7 — ``mode_name=None``, ``started_at`` is Nerve-stamped ISO string.
+
+    Story 3.5 passed ``started_at=None`` (adapter stamped); Story 3.7
+    reshapes step 9 to stamp ``events._utc_now_iso()`` BEFORE the
+    create_session call so Nerve has the value at shutdown time for
+    duration computation.
+    """
     brain = _make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x")
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(
         brain=brain,
         skin=skin,
@@ -488,7 +532,12 @@ async def test_startup_passes_mode_name_none_to_create_session() -> None:
         ),
     )
     await nerve.startup()
-    brain.create_session.assert_awaited_once_with(mode_name=None, started_at=None)
+    # Asserting the kwarg shape — started_at is now a non-None string.
+    assert brain.create_session.await_count == 1
+    call = brain.create_session.call_args
+    assert call.kwargs["mode_name"] is None
+    assert isinstance(call.kwargs["started_at"], str)
+    assert call.kwargs["started_at"]  # non-empty
 
 
 @pytest.mark.asyncio
@@ -524,7 +573,7 @@ def test_startup_raises_keyboard_interrupt_when_signal_handler_ran() -> None:
     """
 
     async def _run() -> None:
-        skin = _make_skin_mock(inputs=["shutdown"])
+        skin = _make_skin_mock(inputs=["shutdown", "skip"])
         brain = _make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x")
         nerve = _build_nerve_system(
             brain=brain,
@@ -555,7 +604,7 @@ async def test_startup_does_not_raise_when_shutdown_command_routed() -> None:
     Asymmetry lock with the previous test: only signal-driven exit
     raises KeyboardInterrupt; user-typed shutdown is a clean exit.
     """
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(
         brain=_make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x"),
         skin=skin,
@@ -601,7 +650,7 @@ async def test_startup_does_not_raise_when_eof_terminates_input() -> None:
 async def test_startup_finally_writes_interrupted_marker_when_repl_raises() -> None:
     """Defense-in-depth — REPL exits via uncaught exception → finally writes is_complete=False."""
     brain = _make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x")
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     # Force route_command to raise an unexpected error AFTER session create.
     skin.parse_command = AsyncMock(side_effect=RuntimeError("synthetic"))
     event_bus = _make_event_bus_mock()
@@ -706,7 +755,7 @@ async def test_briefing_skipped_does_not_call_ritual_build_or_skin_render() -> N
         last_seed="x",
     )
     ritual = _make_ritual_mock(view_model=_state_c_view_model())
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(
         brain=brain,
         ritual=ritual,
@@ -732,7 +781,7 @@ async def test_briefing_rendered_when_policy_returns_false() -> None:
         last_seed="x",
     )
     ritual = _make_ritual_mock(view_model=_state_c_view_model())
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(
         brain=brain,
         ritual=ritual,
@@ -757,7 +806,7 @@ async def test_briefing_skipped_log_includes_prior_session_ended_at(
         last_session=_session_summary(ended_at=twenty_min_ago, is_complete=True),
         last_seed="x",
     )
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(
         brain=brain,
         skin=skin,
@@ -783,7 +832,7 @@ async def test_skip_policy_reads_aggregate_last_session_not_separate_get_call() 
         last_session=_session_summary(is_complete=True),
         last_seed="x",
     )
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(
         brain=brain,
         skin=skin,
@@ -806,6 +855,10 @@ def _build_session_active_nerve() -> tuple[NerveSystem, MagicMock, MagicMock, Ma
     """Build a nerve with _session_active=True so handlers can run standalone.
 
     Returns (nerve, brain_mock, skin_mock, event_bus_mock).
+
+    Story 3.7 adds ``_session_started_at`` (set by startup() step 9 in
+    real flow) — fixture stamps a valid ISO string so handlers that
+    assert on it (``_handle_shutdown``) don't trip the precondition.
     """
     brain = _make_brain_mock()
     skin = _make_skin_mock()
@@ -813,6 +866,7 @@ def _build_session_active_nerve() -> tuple[NerveSystem, MagicMock, MagicMock, Ma
     nerve = _build_nerve_system(brain=brain, skin=skin, event_bus=event_bus)
     nerve._session_id = 42
     nerve._session_active = True
+    nerve._session_started_at = "2026-04-01T10:00:00+00:00"
     return nerve, brain, skin, event_bus
 
 
@@ -907,20 +961,32 @@ async def test_route_command_memory_renders_transparency_placeholder() -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_command_shutdown_calls_brain_emits_renders_then_returns_exit() -> None:
-    """SHUTDOWN ordering: brain.end_session → emit SessionEnded → render → EXIT."""
+async def test_route_command_shutdown_calls_commit_emits_renders_returns_exit() -> None:
+    """Story 3.7 SHUTDOWN ordering: commit_shutdown → audit → emit → render → EXIT.
+
+    Default skin mock returns ``"skip"`` for the seed prompt so the cancel
+    path runs (no SeedSaved emission, ``"Cancelled."`` render). The
+    seed-entered path is locked by Block I tests.
+    """
     nerve, brain, skin, event_bus = _build_session_active_nerve()
+    # Override skin so the REPL ``shutdown`` command isn't consumed by the
+    # seed prompt (handler-only test — REPL is not running).
+    skin.collect_input = AsyncMock(return_value="skip")
     cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
     outcome = await nerve.route_command(cmd)
     assert outcome is CommandOutcome.EXIT
-    brain.end_session.assert_awaited_once_with(42, seed_text=None, summary=None, is_complete=True)
-    # Emit happened
+    brain.commit_shutdown.assert_awaited_once()
+    commit_arg = brain.commit_shutdown.call_args.args[1]
+    assert commit_arg.seed_text is None
+    # SessionEnded emitted (no SeedSaved on cancel path)
     ended = [c for c in event_bus.emit.call_args_list if isinstance(c.args[0], SessionEnded)]
     assert len(ended) == 1
     assert ended[0].args[0].is_complete is True
-    # Render happened
+    assert ended[0].args[0].seed_text is None
+    # Cancellation render — shutdown card + "Cancelled." final line
+    assert skin.render_shutdown_card.call_count == 1
     assert skin.render_response.call_count == 1
-    assert skin.render_response.call_args.args[0] == "Session ended."
+    assert skin.render_response.call_args.args[0] == "Cancelled."
 
 
 @pytest.mark.asyncio
@@ -1000,18 +1066,19 @@ async def test_route_command_dispatch_table_covers_every_command_verb(
 
 
 @pytest.mark.asyncio
-async def test_handle_shutdown_is_idempotent_second_call_returns_exit_no_re_end() -> None:
+async def test_handle_shutdown_is_idempotent_second_call_returns_exit_no_re_commit() -> None:
     """Second SHUTDOWN call is a clean no-op — _session_active guard."""
     nerve, brain, skin, event_bus = _build_session_active_nerve()
+    skin.collect_input = AsyncMock(return_value="skip")
     cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
     first = await nerve.route_command(cmd)
     second = await nerve.route_command(cmd)
     assert first is CommandOutcome.EXIT
     assert second is CommandOutcome.EXIT
-    assert brain.end_session.await_count == 1
+    assert brain.commit_shutdown.await_count == 1
     ended = [c for c in event_bus.emit.call_args_list if isinstance(c.args[0], SessionEnded)]
     assert len(ended) == 1
-    # render_response was called once (first SHUTDOWN); second was no-op
+    # render_response was called once (first SHUTDOWN's "Cancelled."); second was no-op
     assert skin.render_response.call_count == 1
 
 
@@ -1022,8 +1089,12 @@ async def test_handle_shutdown_is_idempotent_second_call_returns_exit_no_re_end(
 
 @pytest.mark.asyncio
 async def test_repl_exits_on_shutdown_command() -> None:
-    """Path (a) — user types ``shutdown``; CommandOutcome.EXIT terminates."""
-    skin = _make_skin_mock(inputs=["shutdown"])
+    """Path (a) — user types ``shutdown``; CommandOutcome.EXIT terminates.
+
+    Story 3.7 — collect_input is called twice: REPL reads "shutdown",
+    then the shutdown flow's seed prompt reads "skip" (cancel).
+    """
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     nerve = _build_nerve_system(
         brain=_make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x"),
         skin=skin,
@@ -1033,13 +1104,17 @@ async def test_repl_exits_on_shutdown_command() -> None:
         ),
     )
     await nerve.startup()
-    assert skin.collect_input.call_count == 1
+    assert skin.collect_input.call_count == 2  # REPL + seed prompt
 
 
 @pytest.mark.asyncio
 async def test_repl_continues_after_unknown_then_exits_on_shutdown() -> None:
-    """UNKNOWN routes, response renders, REPL continues, SHUTDOWN exits."""
-    skin = _make_skin_mock(inputs=["hello", "shutdown"])
+    """UNKNOWN routes, response renders, REPL continues, SHUTDOWN exits.
+
+    Story 3.7 — collect_input is called three times: REPL reads "hello",
+    REPL reads "shutdown", then the shutdown flow's seed prompt reads "skip".
+    """
+    skin = _make_skin_mock(inputs=["hello", "shutdown", "skip"])
     nerve = _build_nerve_system(
         brain=_make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x"),
         skin=skin,
@@ -1049,7 +1124,7 @@ async def test_repl_continues_after_unknown_then_exits_on_shutdown() -> None:
         ),
     )
     await nerve.startup()
-    assert skin.collect_input.call_count == 2
+    assert skin.collect_input.call_count == 3  # 2 REPL + 1 seed prompt
 
 
 @pytest.mark.asyncio
@@ -1118,7 +1193,13 @@ async def test_repl_exits_when_shutdown_event_set_during_input(
 
 @pytest.mark.asyncio
 async def test_repl_eof_error_triggers_clean_shutdown() -> None:
-    """Path (c) — EOFError at input → idempotent _handle_shutdown."""
+    """Path (c) — EOFError at input → idempotent _handle_shutdown.
+
+    Story 3.7 — EOF at REPL still drives _handle_shutdown, which now
+    calls commit_shutdown. The EOF on REPL also propagates to the seed
+    prompt's collect_input → cancel path → no SeedSaved emission, no
+    seed text. commit_shutdown is called once.
+    """
 
     async def raise_eof(prompt: str) -> str:  # noqa: ARG001
         raise EOFError
@@ -1135,8 +1216,13 @@ async def test_repl_eof_error_triggers_clean_shutdown() -> None:
         ),
     )
     await nerve.startup()
-    # end_session called once (via _handle_shutdown EOF branch)
-    assert brain.end_session.await_count == 1
+    # commit_shutdown called once (via _handle_shutdown EOF branch).
+    # The seed prompt's EOF inside _collect_seed_with_reprompt is caught
+    # and treated as cancel — does NOT propagate.
+    assert brain.commit_shutdown.await_count == 1
+    # end_session NOT called for the shutdown path (commit_shutdown does
+    # the session UPDATE inside its transaction).
+    assert brain.end_session.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -1423,7 +1509,7 @@ async def test_startup_cleanup_swallows_brain_failure_no_emit(
 ) -> None:
     """Lines 391-392 — startup finally: brain.end_session failure logs + skips emit."""
     brain = _make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x")
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     skin.parse_command = AsyncMock(side_effect=RuntimeError("REPL force-fail"))
     event_bus = _make_event_bus_mock()
 
@@ -1459,7 +1545,7 @@ async def test_startup_cleanup_swallows_emission_failure(
 ) -> None:
     """Lines 403-404 — startup finally: SessionEnded emit failure logs cleanly."""
     brain = _make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x")
-    skin = _make_skin_mock(inputs=["shutdown"])
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
     skin.parse_command = AsyncMock(side_effect=RuntimeError("REPL force-fail"))
     event_bus = _make_event_bus_mock()
 
@@ -1767,66 +1853,78 @@ async def test_cleanup_skips_end_session_even_when_handler_failed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_shutdown_brain_failure_returns_exit_without_retry(
+async def test_handle_shutdown_commit_failure_returns_exit_leaves_session_active_for_cleanup(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Patch 1 (HIGH) lock — Brain failure does NOT trigger cleanup retry.
+    """Story 3.7 — commit_shutdown failure leaves _session_active=True for cleanup fallback.
 
-    User typed ``shutdown``, Brain ``end_session`` raises. The fix flips
-    ``_session_active=False`` BEFORE the await so cleanup's
-    re-end-session-with-is_complete=False is suppressed. Critical: the
-    user's clean-shutdown intent is NOT silently overwritten with an
-    interrupted-marker.
+    The transaction's all-or-nothing semantics mean no rows landed during
+    the failed commit; ``_cleanup_after_repl`` will write the
+    ``is_complete=False`` interrupted-session marker as the durable
+    record (Story 3.10 detects on next startup).
     """
     brain = _make_brain_mock()
-    brain.end_session = AsyncMock(side_effect=StorageError("synthetic"))
+    brain.commit_shutdown = AsyncMock(side_effect=StorageError("synthetic"))
     event_bus = _make_event_bus_mock()
     skin = _make_skin_mock()
-    nerve = _build_nerve_system(brain=brain, event_bus=event_bus, skin=skin)
+    skin.collect_input = AsyncMock(return_value="skip")
+    audit = _make_audit_mock()
+    nerve = _build_nerve_system(brain=brain, event_bus=event_bus, skin=skin, audit=audit)
     nerve._session_id = 42
     nerve._session_active = True
+    nerve._session_started_at = "2026-04-01T10:00:00+00:00"
     cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
     with caplog.at_level(logging.ERROR, logger="nova.systems.nerve"):
         outcome = await nerve.route_command(cmd)
     assert outcome is CommandOutcome.EXIT
-    assert nerve._session_active is False, (
-        "_session_active must be flipped before the Brain await so cleanup skips"
+    assert nerve._session_active is True, (
+        "_session_active must stay True so cleanup writes the interrupted-marker"
     )
-    # Brain was called once; no retry happened
-    assert brain.end_session.await_count == 1
-    # NO SessionEnded emission (write didn't confirm)
+    # commit_shutdown was called once; no retry happened
+    assert brain.commit_shutdown.await_count == 1
+    # NO SessionEnded / SeedSaved emissions (commit didn't confirm)
     ended = [c for c in event_bus.emit.call_args_list if isinstance(c.args[0], SessionEnded)]
     assert len(ended) == 0
-    # NO confirmation render — user should know something went wrong
-    assert skin.render_response.call_count == 0
+    seed_saved = [c for c in event_bus.emit.call_args_list if isinstance(c.args[0], SeedSaved)]
+    assert len(seed_saved) == 0
+    # Audit logs FAILED outcome
+    assert audit.log_action.await_count == 1
+    audit_call = audit.log_action.call_args
+    assert audit_call.kwargs["details"]["outcome"] == "persistence_failed"
+    # Honest error rendered (not "Planted for tomorrow.")
+    assert skin.render_response.call_count == 1
+    assert "Shutdown failed" in skin.render_response.call_args.args[0]
     # Failure logged
-    assert any("brain.end_session failed" in r.message for r in caplog.records)
+    assert any("commit_shutdown failed" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_handle_shutdown_emit_failure_still_renders_confirmation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Patch 1 lock — emit failure after successful Brain write still renders confirmation.
+    """Story 3.7 — emit failure after successful commit still renders confirmation.
 
-    Brain write is the durable fact; emission is observability. If emit
-    raises after Brain succeeded, the user still gets ``"Session ended."``
-    so they have feedback, but the failure is logged for operators.
+    The transactional commit is the durable fact; emission is
+    observability. If emit raises after commit_shutdown succeeded, the
+    user still gets the ``"Cancelled."`` (or ``"Planted for tomorrow."``)
+    final line — failure is logged for operators only.
     """
     brain = _make_brain_mock()
     event_bus = _make_event_bus_mock()
     event_bus.emit = AsyncMock(side_effect=RuntimeError("broken bus"))
     skin = _make_skin_mock()
+    skin.collect_input = AsyncMock(return_value="skip")
     nerve = _build_nerve_system(brain=brain, event_bus=event_bus, skin=skin)
     nerve._session_id = 42
     nerve._session_active = True
+    nerve._session_started_at = "2026-04-01T10:00:00+00:00"
     cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
     with caplog.at_level(logging.ERROR, logger="nova.systems.nerve"):
         outcome = await nerve.route_command(cmd)
     assert outcome is CommandOutcome.EXIT
     # Confirmation rendered despite emission failure
     assert skin.render_response.call_count == 1
-    assert skin.render_response.call_args.args[0] == "Session ended."
+    assert skin.render_response.call_args.args[0] == "Cancelled."
     # Failure logged
     assert any("SessionEnded emission failed" in r.message for r in caplog.records)
 
@@ -2183,8 +2281,19 @@ async def test_mode_switch_does_not_set_active_mode_name_on_total_failure() -> N
 
 @pytest.mark.asyncio
 async def test_mode_switch_sets_active_mode_name_even_on_partial_restore() -> None:
-    """Hands returns a partial result list — _active_mode_name still set (partial is active)."""
-    coding_mode = _mode("coding")
+    """Hands returns a partial result list — _active_mode_name still set (partial is active).
+
+    Story 3.7 — also asserts _active_mode_apps_launched contains only the
+    apps that successfully launched (not the failed one).
+    """
+    coding_mode = ModeConfig(
+        name="Coding",
+        apps=(
+            AppConfig(name="x", executable="x.exe"),
+            AppConfig(name="y", executable="y.exe"),
+        ),
+        is_default=True,
+    )
     hands = _make_hands_mock()
     hands.restore_mode = AsyncMock(
         return_value=[
@@ -2202,6 +2311,8 @@ async def test_mode_switch_sets_active_mode_name_even_on_partial_restore() -> No
     await nerve.route_command(cmd)
 
     assert nerve._active_mode_name == "coding"
+    # Story 3.7 — apps_launched contains only successful launches
+    assert nerve._active_mode_apps_launched == ("x",)
 
 
 @pytest.mark.asyncio
@@ -2239,3 +2350,832 @@ async def test_mode_switch_returns_continue_outcome() -> None:
     outcome = await nerve.route_command(cmd)
 
     assert outcome is CommandOutcome.CONTINUE
+
+
+# ===========================================================================
+# Story 3.7 Block I — Shutdown happy path (seed entered)
+# ===========================================================================
+
+
+def _build_shutdown_nerve(
+    *,
+    seed_input: str = "finish auth tests",
+    apps_used: tuple[str, ...] = ("VS Code",),
+    active_mode_stem: str | None = "coding",
+    config: NovaConfig | None = None,
+) -> tuple[NerveSystem, MagicMock, MagicMock, MagicMock, MagicMock, MagicMock]:
+    """Build a shutdown-ready nerve with all fields stamped + mocks primed.
+
+    Returns ``(nerve, brain, ritual, skin, event_bus, audit)``.
+    """
+    brain = _make_brain_mock()
+    ritual = _make_ritual_mock()
+    skin = _make_skin_mock()
+    skin.collect_input = AsyncMock(return_value=seed_input)
+    event_bus = _make_event_bus_mock()
+    audit = _make_audit_mock()
+    if config is None:
+        config = _config(modes={"coding": _mode("coding")})
+    nerve = _build_nerve_system(
+        brain=brain,
+        ritual=ritual,
+        skin=skin,
+        event_bus=event_bus,
+        audit=audit,
+        config=config,
+    )
+    nerve._session_id = 42
+    nerve._session_active = True
+    nerve._session_started_at = "2026-04-01T10:00:00+00:00"
+    nerve._active_mode_name = active_mode_stem
+    nerve._active_mode_apps_launched = apps_used
+    return nerve, brain, ritual, skin, event_bus, audit
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_assembles_state_from_runtime_fields() -> None:
+    """Story 3.7 Step 1 — ShutdownState fields populated from runtime state."""
+    nerve, _brain, ritual, _skin, _bus, _audit = _build_shutdown_nerve(
+        seed_input="finish auth tests",
+        apps_used=("VS Code",),
+        active_mode_stem="coding",
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    ritual.begin_shutdown.assert_awaited_once()
+    state = ritual.begin_shutdown.call_args.args[0]
+    assert state.session_id == 42
+    assert state.started_at == "2026-04-01T10:00:00+00:00"
+    assert state.active_mode_stem == "coding"
+    assert state.active_mode_display_name == "Coding"  # _mode("coding").name
+    assert state.apps_used == ("VS Code",)
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_renders_shutdown_card_with_view_model_from_ritual() -> None:
+    nerve, _brain, ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    sentinel_vm = ShutdownViewModel(
+        session_id=42,
+        title="Session ending",
+        mode_label="Mode: Coding",
+        duration_label="Duration: 30m",
+        apps_label="Apps: VS Code",
+        prompt_text="What should you pick up tomorrow?",
+    )
+    ritual.begin_shutdown = AsyncMock(return_value=sentinel_vm)
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    skin.render_shutdown_card.assert_awaited_once_with(sentinel_vm)
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_collects_seed_via_skin_collect_input() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve(
+        seed_input="finish auth tests"
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    skin.collect_input.assert_awaited_once()
+    call_kwargs = skin.collect_input.call_args.kwargs
+    assert call_kwargs["prompt"] == "What should you pick up tomorrow?"
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_calls_commit_shutdown_with_seed_summary_and_apps() -> None:
+    nerve, brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve(
+        seed_input="finish auth tests",
+        apps_used=("VS Code", "Postman"),
+        active_mode_stem="coding",
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    brain.commit_shutdown.assert_awaited_once()
+    session_id_arg, commit_arg = brain.commit_shutdown.call_args.args
+    assert session_id_arg == 42
+    assert commit_arg.seed_text == "finish auth tests"
+    assert commit_arg.summary is not None
+    assert "Coding mode" in commit_arg.summary
+    assert commit_arg.snapshot_apps == ("VS Code", "Postman")
+    assert commit_arg.snapshot_focused_app is None
+    assert commit_arg.snapshot_mode_name == "coding"
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_does_not_call_end_session_or_store_snapshot() -> None:
+    """Story 3.7 — user-typed shutdown goes through commit_shutdown EXCLUSIVELY."""
+    nerve, brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve()
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert brain.end_session.await_count == 0
+    assert brain.store_snapshot.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_audit_seed_capture_success_with_has_seed_true() -> None:
+    nerve, _brain, _ritual, _skin, _bus, audit = _build_shutdown_nerve(
+        seed_input="finish auth tests"
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    audit.log_action.assert_awaited_once()
+    call = audit.log_action.call_args
+    assert call.kwargs["action_type"] == ActionType.SEED_CAPTURE
+    assert call.kwargs["target"] == "42"
+    assert call.kwargs["result"] == "success"
+    assert call.kwargs["details"] == {"has_seed": True, "outcome": "saved"}
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_emits_seed_saved_then_session_ended_in_order() -> None:
+    nerve, _brain, _ritual, _skin, event_bus, _audit = _build_shutdown_nerve(
+        seed_input="finish auth tests"
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    emitted_types = [type(c.args[0]).__name__ for c in event_bus.emit.call_args_list]
+    # SeedSaved first, then SessionEnded
+    assert emitted_types == ["SeedSaved", "SessionEnded"]
+    seed_event = event_bus.emit.call_args_list[0].args[0]
+    ended_event = event_bus.emit.call_args_list[1].args[0]
+    assert seed_event.session_id == 42
+    assert seed_event.seed_text == "finish auth tests"
+    assert ended_event.session_id == 42
+    assert ended_event.seed_text == "finish auth tests"
+    assert ended_event.is_complete is True
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_renders_planted_for_tomorrow_on_seed_path() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve(seed_input="x")
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert skin.render_response.call_args.args[0] == "Planted for tomorrow."
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_returns_exit_outcome_on_seed_path() -> None:
+    nerve, _brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve()
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    outcome = await nerve.route_command(cmd)
+    assert outcome is CommandOutcome.EXIT
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_flips_session_active_to_false_after_commit() -> None:
+    nerve, _brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve()
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert nerve._session_active is False
+
+
+# ===========================================================================
+# Story 3.7 Block II — Cancel paths (no seed)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_skip_returns_no_seed_and_only_session_ended() -> None:
+    nerve, brain, _ritual, skin, event_bus, audit = _build_shutdown_nerve(seed_input="skip")
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    commit_arg = brain.commit_shutdown.call_args.args[1]
+    assert commit_arg.seed_text is None
+    # Only SessionEnded — no SeedSaved
+    emitted_types = [type(c.args[0]).__name__ for c in event_bus.emit.call_args_list]
+    assert emitted_types == ["SessionEnded"]
+    # Audit details
+    assert audit.log_action.call_args.kwargs["details"] == {
+        "has_seed": False,
+        "outcome": "cancelled",
+    }
+    assert audit.log_action.call_args.kwargs["result"] == "skipped"
+    # Render
+    assert skin.render_response.call_args.args[0] == "Cancelled."
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_cancel_uppercase_treated_as_cancel() -> None:
+    nerve, brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve(seed_input="CANCEL")
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert brain.commit_shutdown.call_args.args[1].seed_text is None
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_skip_with_whitespace_strips_to_terminator() -> None:
+    nerve, brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve(seed_input="  skip  ")
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert brain.commit_shutdown.call_args.args[1].seed_text is None
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_cancel_substring_is_seed_text_not_cancel() -> None:
+    """'cancel my plan' is meaningful seed text — exact-match terminator wins."""
+    nerve, brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve(seed_input="cancel my plan")
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert brain.commit_shutdown.call_args.args[1].seed_text == "cancel my plan"
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_eof_during_seed_prompt_treats_as_cancel() -> None:
+    nerve, brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=EOFError)
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    outcome = await nerve.route_command(cmd)
+    assert outcome is CommandOutcome.EXIT
+    assert brain.commit_shutdown.call_args.args[1].seed_text is None
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_keyboard_interrupt_during_prompt_treats_as_cancel() -> None:
+    nerve, brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=KeyboardInterrupt)
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    outcome = await nerve.route_command(cmd)
+    assert outcome is CommandOutcome.EXIT
+    assert brain.commit_shutdown.call_args.args[1].seed_text is None
+
+
+# ===========================================================================
+# Story 3.7 Block III — Empty input + reprompt + outcome shape
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_collect_seed_returns_saved_on_first_attempt_success() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(return_value="seed text")
+    seed, outcome = await nerve._collect_seed_with_reprompt("What should you pick up tomorrow?")
+    assert (seed, outcome) == ("seed text", "saved")
+
+
+@pytest.mark.asyncio
+async def test_collect_seed_returns_saved_on_empty_then_seed() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=["", "finish auth tests"])
+    seed, outcome = await nerve._collect_seed_with_reprompt("First prompt")
+    assert (seed, outcome) == ("finish auth tests", "saved")
+    # Second call uses reprompt copy
+    second_call = skin.collect_input.call_args_list[1]
+    assert second_call.kwargs["prompt"] == "Please confirm or cancel."
+
+
+@pytest.mark.asyncio
+async def test_collect_seed_returns_cancelled_on_first_attempt_skip() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(return_value="skip")
+    seed, outcome = await nerve._collect_seed_with_reprompt("p")
+    assert (seed, outcome) == (None, "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_collect_seed_returns_cancelled_on_first_attempt_cancel_uppercase() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(return_value="CANCEL")
+    seed, outcome = await nerve._collect_seed_with_reprompt("p")
+    assert (seed, outcome) == (None, "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_collect_seed_returns_empty_twice_on_double_empty() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=["", ""])
+    seed, outcome = await nerve._collect_seed_with_reprompt("p")
+    assert (seed, outcome) == (None, "empty_twice")
+
+
+@pytest.mark.asyncio
+async def test_collect_seed_returns_cancelled_on_empty_then_skip() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=["", "skip"])
+    seed, outcome = await nerve._collect_seed_with_reprompt("p")
+    assert (seed, outcome) == (None, "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_collect_seed_returns_cancelled_on_eof_first_attempt() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=EOFError)
+    seed, outcome = await nerve._collect_seed_with_reprompt("p")
+    assert (seed, outcome) == (None, "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_collect_seed_returns_cancelled_on_keyboard_interrupt_second_attempt() -> None:
+    nerve, _brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=["", KeyboardInterrupt])
+    seed, outcome = await nerve._collect_seed_with_reprompt("p")
+    assert (seed, outcome) == (None, "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_empty_then_empty_audits_empty_twice() -> None:
+    nerve, brain, _ritual, skin, _bus, audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=["", ""])
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert brain.commit_shutdown.call_args.args[1].seed_text is None
+    assert audit.log_action.call_args.kwargs["details"] == {
+        "has_seed": False,
+        "outcome": "empty_twice",
+    }
+    assert audit.log_action.call_args.kwargs["result"] == "skipped"
+    assert skin.render_response.call_args.args[0] == "Cancelled."
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_empty_then_skip_audits_cancelled() -> None:
+    nerve, brain, _ritual, skin, _bus, audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=["", "skip"])
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert brain.commit_shutdown.call_args.args[1].seed_text is None
+    assert audit.log_action.call_args.kwargs["details"]["outcome"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_whitespace_only_input_treated_as_empty() -> None:
+    nerve, brain, _ritual, skin, _bus, _audit = _build_shutdown_nerve()
+    skin.collect_input = AsyncMock(side_effect=["   ", "actual seed"])
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    # Reprompt fired → seed entered on second attempt
+    assert skin.collect_input.await_count == 2
+    assert brain.commit_shutdown.call_args.args[1].seed_text == "actual seed"
+
+
+# ===========================================================================
+# Story 3.7 Block IV — Persistence-failure paths
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_commit_failure_does_not_emit_session_ended() -> None:
+    nerve, brain, _ritual, _skin, event_bus, _audit = _build_shutdown_nerve()
+    brain.commit_shutdown = AsyncMock(side_effect=StorageError("simulated"))
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert event_bus.emit.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_commit_failure_leaves_session_active_true_for_cleanup() -> None:
+    nerve, brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve()
+    brain.commit_shutdown = AsyncMock(side_effect=StorageError("simulated"))
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert nerve._session_active is True
+
+
+# ===========================================================================
+# Story 3.7 Block V — Active-mode integration
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_with_no_active_mode_omits_mode_in_state() -> None:
+    nerve, brain, ritual, _skin, _bus, _audit = _build_shutdown_nerve(
+        active_mode_stem=None,
+        apps_used=(),
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    state = ritual.begin_shutdown.call_args.args[0]
+    assert state.active_mode_stem is None
+    assert state.active_mode_display_name is None
+    assert state.apps_used == ()
+    commit_arg = brain.commit_shutdown.call_args.args[1]
+    assert commit_arg.snapshot_mode_name is None
+    assert commit_arg.snapshot_apps == ()
+    assert commit_arg.summary is None  # no display name → no summary text
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_resolves_active_mode_display_name_from_config() -> None:
+    study_mode = ModeConfig(
+        name="Study Group",
+        apps=(AppConfig(name="App1", executable="a.exe"),),
+        is_default=False,
+    )
+    nerve, _brain, ritual, _skin, _bus, _audit = _build_shutdown_nerve(
+        active_mode_stem="study-group",
+        apps_used=("App1",),
+        config=_config(modes={"study-group": study_mode}),
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    state = ritual.begin_shutdown.call_args.args[0]
+    assert state.active_mode_display_name == "Study Group"
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_summary_uses_display_name_not_stem() -> None:
+    study_mode = ModeConfig(
+        name="Study Group",
+        apps=(AppConfig(name="App1", executable="a.exe"),),
+        is_default=False,
+    )
+    nerve, brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve(
+        active_mode_stem="study-group",
+        apps_used=("App1",),
+        config=_config(modes={"study-group": study_mode}),
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    summary = brain.commit_shutdown.call_args.args[1].summary
+    assert summary is not None
+    assert summary.startswith("Study Group mode")  # not "study-group mode"
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_snapshot_mode_name_uses_stem_not_display_name() -> None:
+    study_mode = ModeConfig(
+        name="Study Group",
+        apps=(AppConfig(name="App1", executable="a.exe"),),
+        is_default=False,
+    )
+    nerve, brain, _ritual, _skin, _bus, _audit = _build_shutdown_nerve(
+        active_mode_stem="study-group",
+        apps_used=("App1",),
+        config=_config(modes={"study-group": study_mode}),
+    )
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert brain.commit_shutdown.call_args.args[1].snapshot_mode_name == "study-group"
+
+
+# ===========================================================================
+# Story 3.7 Block VI — startup() step 9 reshape (_session_started_at)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_startup_stamps_session_started_at_before_create_session() -> None:
+    """startup() step 9 — Nerve stamps started_at BEFORE the create_session await."""
+    brain = _make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x")
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
+    nerve = _build_nerve_system(
+        brain=brain,
+        skin=skin,
+        config=_config(
+            modes={"coding": _mode("coding")},
+            settings=UserSettings(skip_briefing_if_recent=False),
+        ),
+    )
+    await nerve.startup()
+    # _session_started_at populated; matches what was passed to create_session
+    create_call = brain.create_session.call_args
+    stamped_value = create_call.kwargs["started_at"]
+    assert isinstance(stamped_value, str)
+    assert stamped_value  # non-empty
+
+
+@pytest.mark.asyncio
+async def test_cleanup_after_repl_resets_session_started_at_and_apps() -> None:
+    """Cleanup defensively resets the Story 3.6/3.7 mode-tracking + start fields."""
+    brain = _make_brain_mock(last_session=_session_summary(is_complete=True), last_seed="x")
+    skin = _make_skin_mock(inputs=["shutdown", "skip"])
+    nerve = _build_nerve_system(
+        brain=brain,
+        skin=skin,
+        config=_config(
+            modes={"coding": _mode("coding")},
+            settings=UserSettings(skip_briefing_if_recent=False),
+        ),
+    )
+    await nerve.startup()
+    assert nerve._session_started_at is None
+    assert nerve._active_mode_apps_launched == ()
+    assert nerve._active_mode_name is None
+
+
+# ===========================================================================
+# Story 3.7 Block VII — _handle_mode_switch sets _active_mode_apps_launched
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_sets_active_mode_apps_launched_to_successful_apps() -> None:
+    """All 3 apps succeed → tuple contains all 3 names in order."""
+    coding_mode = ModeConfig(
+        name="Coding",
+        apps=(
+            AppConfig(name="App1", executable="a.exe"),
+            AppConfig(name="App2", executable="b.exe"),
+            AppConfig(name="App3", executable="c.exe"),
+        ),
+        is_default=True,
+    )
+    hands = _make_hands_mock()
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(action_type=ActionType.APP_LAUNCH, target=name, success=True, reason=None)
+            for name in ("App1", "App2", "App3")
+        ]
+    )
+    nerve = _build_nerve_system(hands=hands, config=_config(modes={"coding": coding_mode}))
+    nerve._session_id = 42
+    nerve._session_active = True
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert nerve._active_mode_apps_launched == ("App1", "App2", "App3")
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_partial_keeps_only_successful_apps() -> None:
+    """3 apps, app 2 fails → tuple contains just App1 + App3."""
+    coding_mode = ModeConfig(
+        name="Coding",
+        apps=(
+            AppConfig(name="App1", executable="a.exe"),
+            AppConfig(name="App2", executable="b.exe"),
+            AppConfig(name="App3", executable="c.exe"),
+        ),
+        is_default=True,
+    )
+    hands = _make_hands_mock()
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH, target="App1", success=True, reason=None
+            ),
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH, target="App2", success=False, reason="not found"
+            ),
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH, target="App3", success=True, reason=None
+            ),
+        ]
+    )
+    nerve = _build_nerve_system(hands=hands, config=_config(modes={"coding": coding_mode}))
+    nerve._session_id = 42
+    nerve._session_active = True
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert nerve._active_mode_apps_launched == ("App1", "App3")
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_total_failure_clears_active_mode_apps_launched() -> None:
+    coding_mode = _mode("coding")
+    hands = _make_hands_mock()
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH, target="x", success=False, reason="not found"
+            ),
+        ]
+    )
+    nerve = _build_nerve_system(hands=hands, config=_config(modes={"coding": coding_mode}))
+    nerve._session_id = 42
+    nerve._session_active = True
+    nerve._active_mode_apps_launched = ("stale", "data")  # ensure cleared
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert len(nerve._active_mode_apps_launched) == 0
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_overwrites_active_mode_apps_launched_on_second_switch() -> None:
+    """First switch sets coding apps; second switch overwrites to study apps."""
+    coding_mode = ModeConfig(
+        name="Coding",
+        apps=(AppConfig(name="VS Code", executable="code.exe"),),
+        is_default=False,
+    )
+    study_mode = ModeConfig(
+        name="Study",
+        apps=(
+            AppConfig(name="Notion", executable="notion.exe"),
+            AppConfig(name="Anki", executable="anki.exe"),
+        ),
+        is_default=False,
+    )
+    hands = _make_hands_mock()
+
+    async def restore(stem: str, mode_config: ModeConfig) -> list[ActionResult]:
+        return [
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH, target=app.name, success=True, reason=None
+            )
+            for app in mode_config.apps
+        ]
+
+    hands.restore_mode = AsyncMock(side_effect=restore)
+    nerve = _build_nerve_system(
+        hands=hands,
+        config=_config(modes={"coding": coding_mode, "study": study_mode}),
+    )
+    nerve._session_id = 42
+    nerve._session_active = True
+    await nerve.route_command(
+        Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    )
+    assert tuple(nerve._active_mode_apps_launched) == ("VS Code",)
+    await nerve.route_command(
+        Command(verb=CommandVerb.MODE, target="study", raw_input="x", is_contextual=False)
+    )
+    assert tuple(nerve._active_mode_apps_launched) == ("Notion", "Anki")
+
+
+# ===========================================================================
+# Story 3.7 Block VIII — Audit isolation (AST guard)
+# ===========================================================================
+
+
+def test_handle_shutdown_does_not_wrap_audit_log_action_in_try_except() -> None:
+    """AST guard — audit.log_action is never DEFENSIVELY wrapped in try/except.
+
+    Mirrors Story 3.6's HandsSystem audit-isolation pattern. The
+    contract: ``audit.log_action`` calls in the SUCCESS path body of a
+    Try (would catch audit's own programmer errors) are forbidden.
+    Calls inside an ``except`` handler are permitted — those are the
+    natural placement of failure-path audit (e.g., the
+    ``commit_shutdown`` failure handler).
+
+    Walks every ``ast.Try`` and asserts the Try's body (top-level
+    statements, NOT handler bodies) contains no
+    ``self._audit.log_action`` call. This catches the disaster pattern
+    where a future regression adds ``try: await
+    self._audit.log_action(...) except StorageError: pass`` — which
+    would silently swallow programmer errors AuditLogger raises by
+    design (TypeError from non-JSON details, ValueError from empty
+    result, etc.).
+    """
+    import ast as _ast
+    import inspect as _inspect
+    import textwrap
+
+    from nova.systems.nerve.system import NerveSystem
+
+    source = textwrap.dedent(_inspect.getsource(NerveSystem._handle_shutdown))
+    tree = _ast.parse(source)
+    violations: list[tuple[int, str]] = []
+
+    def _calls_audit_log_action(node: _ast.AST) -> bool:
+        for child in _ast.walk(node):
+            if not isinstance(child, _ast.Call):
+                continue
+            func = child.func
+            if not isinstance(func, _ast.Attribute) or func.attr != "log_action":
+                continue
+            value = func.value
+            if not isinstance(value, _ast.Attribute) or value.attr != "_audit":
+                continue
+            inner = value.value
+            if isinstance(inner, _ast.Name) and inner.id == "self":
+                return True
+        return False
+
+    for try_node in _ast.walk(tree):
+        if not isinstance(try_node, _ast.Try):
+            continue
+        # Only flag audit calls in the try's BODY (defensive wrap) —
+        # handler bodies are legitimate failure-path audit placement.
+        for stmt in try_node.body:
+            if _calls_audit_log_action(stmt):
+                violations.append((try_node.lineno, "body"))
+
+    assert not violations, (
+        f"audit.log_action wrapped in try/except at: {violations} — "
+        "Story 1.8's StorageError swallow is the boundary; Nerve does NOT wrap"
+    )
+
+
+# ===========================================================================
+# Story 3.7 — coverage completion (defensive branches)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_seed_saved_emit_failure_still_renders_planted() -> None:
+    """SeedSaved emission failure on the seed-entered path is observability-only.
+
+    Covers nerve.system._handle_shutdown's SeedSaved emit-failure branch
+    (the cancel path covers SessionEnded's emit-failure branch).
+    """
+    nerve, _brain, _ritual, skin, event_bus, _audit = _build_shutdown_nerve(
+        seed_input="finish auth tests"
+    )
+    event_bus.emit = AsyncMock(side_effect=RuntimeError("broken bus"))
+    cmd = Command(verb=CommandVerb.SHUTDOWN, target=None, raw_input="shutdown", is_contextual=False)
+    outcome = await nerve.route_command(cmd)
+    assert outcome is CommandOutcome.EXIT
+    # Confirmation rendered despite both emissions failing.
+    assert skin.render_response.call_args.args[0] == "Planted for tomorrow."
+
+
+@pytest.mark.asyncio
+async def test_resolve_active_mode_display_name_returns_none_when_mode_deleted() -> None:
+    """Defensive — mode_name is set but config.modes lookup misses (mode deleted)."""
+    # Build a config WITHOUT "coding"; force _active_mode_name to "coding".
+    nerve = _build_nerve_system(config=_config(modes={}))
+    nerve._active_mode_name = "coding"  # set, but no longer in config
+    assert nerve._resolve_active_mode_display_name() is None
+
+
+# ===========================================================================
+# Story 3.7 review patches — _build_session_summary_text hardening
+# ===========================================================================
+
+
+def test_build_session_summary_text_returns_none_for_empty_display_name() -> None:
+    """Patch — empty / whitespace-only display name → None (no leading-space artifact)."""
+    from nova.systems.nerve.system import _build_session_summary_text
+    from nova.systems.ritual.models import ShutdownState
+
+    base_state = ShutdownState(
+        session_id=42,
+        started_at="2026-04-01T10:00:00+00:00",
+        ended_at="2026-04-01T10:30:00+00:00",
+        active_mode_stem="coding",
+        active_mode_display_name="",
+        apps_used=(),
+    )
+    assert _build_session_summary_text(base_state) is None
+    whitespace_state = ShutdownState(
+        session_id=42,
+        started_at="2026-04-01T10:00:00+00:00",
+        ended_at="2026-04-01T10:30:00+00:00",
+        active_mode_stem="coding",
+        active_mode_display_name="   ",
+        apps_used=(),
+    )
+    assert _build_session_summary_text(whitespace_state) is None
+
+
+def test_build_session_summary_text_escapes_commas_in_display_name() -> None:
+    """Patch — comma-in-display-name escapes per Story 3.3's _escape_label_value rule."""
+    from nova.systems.nerve.system import _build_session_summary_text
+    from nova.systems.ritual.models import ShutdownState
+
+    state = ShutdownState(
+        session_id=42,
+        started_at="2026-04-01T10:00:00+00:00",
+        ended_at="2026-04-01T10:30:00+00:00",
+        active_mode_stem="coding-tests",
+        active_mode_display_name="Coding, Tests",
+        apps_used=(),
+    )
+    result = _build_session_summary_text(state)
+    assert result == "Coding\\, Tests mode, 30m"
+
+
+def test_build_session_summary_text_escapes_backslash_before_comma() -> None:
+    """Patch — backslash escapes first so a literal `\\` doesn't double-process."""
+    from nova.systems.nerve.system import _build_session_summary_text
+    from nova.systems.ritual.models import ShutdownState
+
+    state = ShutdownState(
+        session_id=42,
+        started_at="2026-04-01T10:00:00+00:00",
+        ended_at="2026-04-01T10:30:00+00:00",
+        active_mode_stem="coding",
+        active_mode_display_name="Path\\Coding",
+        apps_used=(),
+    )
+    result = _build_session_summary_text(state)
+    assert result == "Path\\\\Coding mode, 30m"
+
+
+def test_classify_audit_outcome_raises_on_unknown_outcome() -> None:
+    """Patch — explicit raise on unknown _SeedOutcome member.
+
+    A future regression that adds a fourth outcome (e.g. via runtime
+    string injection) must NOT silently default to RESULT_SKIPPED.
+    """
+    import pytest
+
+    from nova.systems.nerve.system import _classify_audit_outcome
+
+    with pytest.raises(ValueError, match="unknown _SeedOutcome member"):
+        _classify_audit_outcome("rogue_outcome")  # type: ignore[arg-type]
+
+
+def test_classify_audit_outcome_each_known_member_resolves() -> None:
+    """Patch — explicit assertion that every known _SeedOutcome resolves."""
+    from nova.core.audit import RESULT_SKIPPED, RESULT_SUCCESS
+    from nova.systems.nerve.system import _classify_audit_outcome
+
+    assert _classify_audit_outcome("saved") == RESULT_SUCCESS
+    assert _classify_audit_outcome("cancelled") == RESULT_SKIPPED
+    assert _classify_audit_outcome("empty_twice") == RESULT_SKIPPED
+
+
+def test_build_session_summary_text_strips_whitespace_around_display_name() -> None:
+    """Patch — leading/trailing whitespace on display name is stripped."""
+    from nova.systems.nerve.system import _build_session_summary_text
+    from nova.systems.ritual.models import ShutdownState
+
+    state = ShutdownState(
+        session_id=42,
+        started_at="2026-04-01T10:00:00+00:00",
+        ended_at="2026-04-01T10:30:00+00:00",
+        active_mode_stem="coding",
+        active_mode_display_name="  Coding  ",
+        apps_used=(),
+    )
+    result = _build_session_summary_text(state)
+    assert result == "Coding mode, 30m"

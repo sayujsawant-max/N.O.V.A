@@ -83,11 +83,18 @@ def _short_circuit_nerve_repl(monkeypatch: pytest.MonkeyPatch) -> None:
     ``Prompt.ask`` and pytest's stdin-capture raises ``OSError``, which
     the REPL doesn't catch.
 
-    Patching ``Prompt.ask`` to return ``"shutdown"`` makes every test's
-    REPL exit on its first iteration, preserving the bootstrap-only
-    intent of these tests.
+    Story 3.7 — Prompt.ask is now called twice per shutdown: REPL reads
+    the SHUTDOWN command, then the seed prompt reads the seed text or
+    a cancel terminator. Returning an iterator with ``"shutdown"`` then
+    ``"skip"`` exits the REPL via SHUTDOWN and cancels the seed prompt
+    via the ``"skip"`` terminator. Subsequent calls (defensive) also
+    return ``"skip"`` so any extra prompts don't crash the test.
     """
-    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: "shutdown")
+    inputs = iter(["shutdown", "skip"])
+    monkeypatch.setattr(
+        "nova.adapters.rich.skin.Prompt.ask",
+        lambda *a, **kw: next(inputs, "skip"),
+    )
 
 
 def _invoke_nova(
@@ -133,13 +140,12 @@ def test_cli_boots_and_exits_cleanly(
     assert (nova_data_dir / "nova.db").exists()
 
     captured = capsys.readouterr()
-    # Story 3.5 — Skin renders the briefing card + "Session ended." to
-    # stdout when the autouse REPL fixture drives the synthetic SHUTDOWN.
-    # Assert the briefing render fired (anti-regression for "did the
-    # briefing actually render at the end of the boot path?") instead of
-    # the now-stale "no stdout" claim.
+    # Story 3.5 — Skin renders the briefing card to stdout.
+    # Story 3.7 — Skin also renders the shutdown card + "Cancelled." final
+    # line when the autouse REPL fixture drives SHUTDOWN → seed-cancel.
     assert "Session Briefing" in captured.out
-    assert "Session ended." in captured.out
+    assert "Session ending" in captured.out
+    assert "Cancelled." in captured.out
     # No stderr on the happy path — Phase A handler must have been
     # removed before the success INFO lines fired.
     assert captured.err == ""
