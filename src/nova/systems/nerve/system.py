@@ -108,6 +108,7 @@ from nova.core.events import EventBus, SessionEnded, SessionStarted
 from nova.core.tiers import TierManager
 from nova.core.types import BriefingState, CapabilityTier
 from nova.ports.brain import BrainPort
+from nova.ports.hands import HandsPort
 from nova.ports.ritual import RitualPort
 from nova.ports.skin import SkinPort
 from nova.systems.brain.models import SessionSummary
@@ -218,6 +219,7 @@ class NerveSystem:
         event_bus: EventBus,
         tier_manager: TierManager,
         config: NovaConfig,
+        hands: HandsPort,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._brain = brain
@@ -226,6 +228,7 @@ class NerveSystem:
         self._event_bus = event_bus
         self._tier_manager = tier_manager
         self._config = config
+        self._hands = hands
         self._clock = clock
         # Lifecycle state — initialized at the start of every startup() call
         # so a re-invocation (e.g., a future story that supports re-entry)
@@ -236,6 +239,14 @@ class NerveSystem:
         self._session_active: bool = False
         self._prompt_context: str | None = None
         self._signal_handlers_installed: bool = False
+        # Story 3.6 — active mode tracker (the canonical stem, set by
+        # _handle_mode_switch on successful restore, read by Story 3.7's
+        # shutdown summary and Story 3.9's status command). The field is
+        # named _active_mode_name for grep-continuity with the existing
+        # mode_name parameter on BrainPort.create_session and the
+        # ModeRestored.mode_name event field; its value is always the
+        # stem (kebab-case YAML basename), NOT the display label.
+        self._active_mode_name: str | None = None
         # Track which sync handler we replaced on Windows so uninstall
         # restores the prior behavior instead of silently dropping it.
         self._previous_sigint_handler: object | None = None
@@ -825,10 +836,63 @@ class NerveSystem:
         return CommandOutcome.CONTINUE
 
     async def _handle_mode_switch(self, command: Command) -> CommandOutcome:
-        """Placeholder — Story 3.6 replaces this body with HandsPort delegation."""
-        await self._skin.render_response(
-            f"Mode restore lands in Story 3.6. Stub: would switch to {command.target!r}."
-        )
+        """Delegate to :meth:`HandsPort.restore_mode` for the user-named mode.
+
+        Mode restore is purely-local (no cloud surface) — does NOT
+        consult :meth:`_tier_check_or_offline_response`. Even in
+        OFFLINE tier, ``mode <stem>`` works. Documented scope fence;
+        locked by ``test_mode_switch_does_not_consult_tier_manager``.
+
+        ``command.target`` is user-typed and **preserves casing** per
+        the Story 3.4 parser contract (``mode Coding`` →
+        ``target="Coding"``; ``Switch to Deep Work mode`` →
+        ``target="Deep Work"``). The lookup against
+        ``NovaConfig.modes`` is **case-insensitive at Nerve's level**
+        (Story 3.4 spec line 406): kebab-case stems in
+        ``%LOCALAPPDATA%/nova/modes/<stem>.yaml`` are validated
+        lowercase by Story 1.6's loader, so ``command.target.lower()``
+        is the canonical lookup key. The user-facing error message
+        echoes the ORIGINAL casing so the user recognizes what they
+        typed; downstream identity (``hands.restore_mode``,
+        ``_active_mode_name``, ``ModeRestored.mode_name``, audit
+        ``target``, ``mode edit <stem>`` hints) all use the
+        lowercased canonical stem.
+
+        Tracks the active mode in :attr:`_active_mode_name` (the
+        canonical stem) for Story 3.7's shutdown summary and Story
+        3.9's status command. Set on successful restore (even
+        partial — partial is still "active"); cleared on total
+        failure so the status command and shutdown summary don't
+        claim a previously-restored mode is still active.
+        """
+        assert command.target is not None  # parser guarantees for MODE/<target>
+        # Case-insensitive lookup per Story 3.4 contract — kebab-case
+        # stems are always lowercase, but the parser preserves the
+        # user's original casing in target.
+        mode_stem = command.target.lower()
+        mode_config = self._config.modes.get(mode_stem)
+        if mode_config is None:
+            # Echo the user's original casing in the error so they
+            # recognize what they typed (NOT the lowercased lookup key).
+            await self._skin.render_response(
+                f"No mode named '{command.target}'. Try mode to see available modes."
+            )
+            return CommandOutcome.CONTINUE
+        results = await self._hands.restore_mode(mode_stem, mode_config)
+        # Reflect the LATEST restore outcome — both first-time and
+        # overwrite. Set to ``mode_stem`` on any-success (full or
+        # partial — partial is still "active"); clear to None on total
+        # failure so the status command and shutdown summary don't
+        # claim a previously-restored mode is still active after the
+        # user just saw "No apps could be launched". Without the
+        # else-clear branch a sequence like ``mode coding`` (succeeds)
+        # → ``mode coding`` (all apps now uninstalled, total failure)
+        # would leave ``_active_mode_name == "coding"`` — lying to
+        # Story 3.7's shutdown summary and Story 3.9's status.
+        if any(r.success for r in results):
+            self._active_mode_name = mode_stem
+        else:
+            self._active_mode_name = None
         return CommandOutcome.CONTINUE
 
     async def _handle_mode_create(self, command: Command) -> CommandOutcome:

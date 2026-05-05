@@ -803,3 +803,92 @@ def test_mode_info_is_distinct_from_mode_config() -> None:
         "ModeConfig must carry at least one field that ModeInfo does not — the "
         "two types must genuinely differ in shape."
     )
+
+
+# ===========================================================================
+# Story 3.6 — SkinPort.render_progress reshape + AppLauncherPort
+# ===========================================================================
+
+
+def test_skin_port_render_progress_takes_single_action_result_not_sequence() -> None:
+    """Story 3.6 reshape — ``render_progress`` accepts a single ``ActionResult``.
+
+    The Story 1.9 stub typed the parameter as ``Sequence[ActionResult]``
+    on the assumption that Hands would batch the per-app results.
+    Story 3.6's epic AC requires per-app inline streaming, so the
+    signature is now a single result per call. Use
+    :func:`typing.get_type_hints` to resolve the runtime type past
+    ``from __future__ import annotations``.
+    """
+    from nova.ports.skin import SkinPort
+    from nova.systems.hands.models import ActionResult
+
+    hints = typing.get_type_hints(SkinPort.render_progress)
+    # The "result" parameter must resolve to ActionResult (NOT Sequence[ActionResult]).
+    assert "result" in hints, (
+        f"SkinPort.render_progress must take a single 'result' parameter; got hints={hints!r}."
+    )
+    assert hints["result"] is ActionResult, (
+        f"SkinPort.render_progress.result must be ActionResult (the Story 3.6 "
+        f"reshape from Sequence[ActionResult]); resolved to {hints['result']!r}."
+    )
+    # Reject the historical 'results' (plural) parameter name as well.
+    assert "results" not in hints, (
+        "SkinPort.render_progress must NOT carry a 'results' parameter — "
+        "Story 3.6 reshape replaced the batch with single-result-per-call."
+    )
+
+
+def test_app_launcher_port_has_single_method_launch_app() -> None:
+    """Story 3.6 — ``AppLauncherPort`` exposes exactly one method: ``launch_app``."""
+    import nova.ports.app_launcher as app_launcher_module
+    from nova.ports.app_launcher import AppLauncherPort
+
+    class_def = _port_class_def(app_launcher_module, "AppLauncherPort")
+    method_names = tuple(
+        node.name
+        for node in class_def.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+    assert method_names == ("launch_app",), (
+        f"AppLauncherPort method drift: expected ('launch_app',), got {method_names}."
+    )
+
+    # Runtime-resolved signature: launch_app(app: AppConfig) -> ActionResult.
+    from nova.core.config import AppConfig
+    from nova.systems.hands.models import ActionResult
+
+    hints = typing.get_type_hints(AppLauncherPort.launch_app)
+    assert hints.get("app") is AppConfig, (
+        f"AppLauncherPort.launch_app.app must be AppConfig; resolved to {hints.get('app')!r}."
+    )
+    assert hints.get("return") is ActionResult, (
+        f"AppLauncherPort.launch_app must return ActionResult; resolved to {hints.get('return')!r}."
+    )
+
+
+def test_app_launcher_port_module_exports_canonical_reason_constants() -> None:
+    """Story 3.6 — the four canonical reason constants live in the port module.
+
+    Locks the port-as-vocabulary-owner pattern (mirror of
+    ``nova.core.audit`` exporting RESULT_SUCCESS / RESULT_FAILED). The
+    closed four-member set excludes ``REASON_ALREADY_RUNNING`` because
+    already-running maps to ``success=True`` per AC #3 step 2.
+    """
+    import nova.ports.app_launcher as app_launcher_module
+
+    expected = {
+        "REASON_NOT_FOUND",
+        "REASON_PERMISSION_DENIED",
+        "REASON_TIMED_OUT",
+        "REASON_UNKNOWN_ERROR",
+    }
+    assert expected.issubset(set(app_launcher_module.__all__)), (
+        f"nova.ports.app_launcher.__all__ must export the four canonical reason "
+        f"constants; missing: {sorted(expected - set(app_launcher_module.__all__))}."
+    )
+    # Already-running is NOT in the public vocabulary (it returns success=True).
+    assert "REASON_ALREADY_RUNNING" not in app_launcher_module.__all__, (
+        "REASON_ALREADY_RUNNING must NOT be exported — already-running is a "
+        "successful workspace outcome (success=True), not a failure reason."
+    )

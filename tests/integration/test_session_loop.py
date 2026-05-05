@@ -210,3 +210,217 @@ def test_bare_nova_skips_briefing_when_prior_session_recent(
     # Verify the skip log line is in nova.log.
     log_text = (nova_data_dir / "logs" / "nova.log").read_text(encoding="utf-8")
     assert "briefing skipped" in log_text
+
+
+# ===========================================================================
+# Scenario 3 + 4: Story 3.6 — mode restore end-to-end (windows_only)
+# ===========================================================================
+
+
+def _stash_spawned_pids(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Wrap ``subprocess.Popen`` so spawned PIDs are stashed for cleanup.
+
+    Returns a list that the test passes to teardown — terminating
+    by spawned PID (not by name) avoids killing user notepads.
+    """
+    import subprocess as _subprocess
+    from typing import Any
+
+    real_popen = _subprocess.Popen
+    spawned_pids: list[int] = []
+
+    def wrapping_popen(*args: Any, **kwargs: Any) -> Any:
+        proc = real_popen(*args, **kwargs)
+        spawned_pids.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr("nova.adapters.win32.actions.subprocess.Popen", wrapping_popen)
+    return spawned_pids
+
+
+def _terminate_spawned(spawned_pids: list[int]) -> None:
+    """Best-effort terminate by PID — used in test teardown."""
+    import psutil
+
+    for pid in spawned_pids:
+        try:
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except psutil.TimeoutExpired:
+                proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Already gone or refused — both fine for cleanup.
+            pass
+
+
+@pytest.fixture
+def notepad_mode_data_dir(tmp_path: Path) -> Path:
+    """Seed a data dir whose ``coding`` mode launches Notepad only.
+
+    Notepad is present on every Windows install, so the launch is
+    deterministic. The mode YAML uses the stem ``coding`` so the
+    user's typed ``mode coding`` resolves cleanly.
+    """
+    (tmp_path / "settings.yaml").write_text(
+        'api_key: "sk-ant-test-mode-restore"\n', encoding="utf-8"
+    )
+    (tmp_path / "exclusions.yaml").write_text("{}\n", encoding="utf-8")
+    modes_dir = tmp_path / "modes"
+    modes_dir.mkdir()
+    (modes_dir / "coding.yaml").write_text(
+        "name: Coding\napps:\n  - name: Notepad\n    executable: notepad.exe\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+@pytest.fixture
+def notepad_partial_data_dir(tmp_path: Path) -> Path:
+    """Seed a coding mode with one real app (Notepad) + one bogus app."""
+    (tmp_path / "settings.yaml").write_text(
+        'api_key: "sk-ant-test-mode-restore-partial"\n', encoding="utf-8"
+    )
+    (tmp_path / "exclusions.yaml").write_text("{}\n", encoding="utf-8")
+    modes_dir = tmp_path / "modes"
+    modes_dir.mkdir()
+    (modes_dir / "coding.yaml").write_text(
+        "name: Coding\n"
+        "apps:\n"
+        "  - name: Notepad\n"
+        "    executable: notepad.exe\n"
+        "  - name: Bogus XYZ\n"
+        "    executable: bogus_xyz_app_that_does_not_exist.exe\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+@pytest.mark.windows_only
+def test_mode_restore_full_workspace_ready_end_to_end(
+    notepad_mode_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Full happy path with REAL Win32HandsAdapter.
+
+    ``mode coding`` → Notepad launches via subprocess.Popen → audit row
+    fires → render line appears → ``ModeRestored`` emits → final
+    summary renders → ``shutdown`` exits cleanly.
+    """
+    import asyncio
+
+    # Seed a prior session (2h ago) so State C briefing renders rather
+    # than skip-briefing firing.
+    two_hours_ago = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    asyncio.run(
+        _seed_prior_session(
+            notepad_mode_data_dir / "nova.db",
+            ended_at=two_hours_ago,
+            seed_text="prior seed",
+        )
+    )
+
+    # Stash spawned PIDs for cleanup.
+    spawned_pids = _stash_spawned_pids(monkeypatch)
+
+    # Iterator-backed Prompt.ask: returns "mode coding" then "shutdown".
+    inputs = iter(["mode coding", "shutdown"])
+    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: next(inputs))
+
+    try:
+        exit_code = _invoke_nova(monkeypatch, notepad_mode_data_dir)
+        assert exit_code == EXIT_OK
+
+        captured = capsys.readouterr()
+        # Per-app render line.
+        assert "✓ Notepad" in captured.out
+        # Final-line summary (full success).
+        assert "Workspace ready." in captured.out
+        # SHUTDOWN handler ran.
+        assert "Session ended." in captured.out
+
+        # Verify the audit log: 1 app_launch/success + 1 mode_restore/success.
+        async def _read_audit() -> list[dict[str, object]]:
+            storage = SqliteStorageEngine(notepad_mode_data_dir / "nova.db")
+            await storage.start()
+            try:
+                rows = await storage.fetchall(
+                    "SELECT action_type, target, result, details FROM audit_log ORDER BY id"
+                )
+                return [dict(row) for row in rows]
+            finally:
+                await storage.close()
+
+        audit_rows = asyncio.run(_read_audit())
+        app_launch_rows = [r for r in audit_rows if r["action_type"] == "app_launch"]
+        mode_restore_rows = [r for r in audit_rows if r["action_type"] == "mode_restore"]
+        assert len(app_launch_rows) == 1
+        assert app_launch_rows[0]["result"] == "success"
+        assert app_launch_rows[0]["target"] == "Notepad"
+        assert len(mode_restore_rows) == 1
+        assert mode_restore_rows[0]["result"] == "success"
+        assert mode_restore_rows[0]["target"] == "coding"  # stem, not display
+    finally:
+        _terminate_spawned(spawned_pids)
+
+
+@pytest.mark.windows_only
+def test_mode_restore_partial_failure_workspace_partially_ready(
+    notepad_partial_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Partial-restore: 1 of 2 apps launches; final line distinguishes from full.
+
+    Notepad launches; ``bogus_xyz_app_that_does_not_exist.exe`` raises
+    ``FileNotFoundError`` (no args, so the os.startfile fallback also
+    runs and also fails) and maps to ``REASON_NOT_FOUND``.
+    """
+    import asyncio
+
+    two_hours_ago = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    asyncio.run(
+        _seed_prior_session(
+            notepad_partial_data_dir / "nova.db",
+            ended_at=two_hours_ago,
+            seed_text="prior seed",
+        )
+    )
+
+    spawned_pids = _stash_spawned_pids(monkeypatch)
+    inputs = iter(["mode coding", "shutdown"])
+    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: next(inputs))
+
+    try:
+        exit_code = _invoke_nova(monkeypatch, notepad_partial_data_dir)
+        assert exit_code == EXIT_OK
+
+        captured = capsys.readouterr()
+        assert "✓ Notepad" in captured.out
+        assert "✗ Bogus XYZ (not found — is it installed?)" in captured.out
+        assert "Workspace partially ready. Bogus XYZ was skipped." in captured.out
+        assert "Session ended." in captured.out
+
+        async def _read_audit() -> list[dict[str, object]]:
+            storage = SqliteStorageEngine(notepad_partial_data_dir / "nova.db")
+            await storage.start()
+            try:
+                rows = await storage.fetchall(
+                    "SELECT action_type, target, result FROM audit_log ORDER BY id"
+                )
+                return [dict(row) for row in rows]
+            finally:
+                await storage.close()
+
+        audit_rows = asyncio.run(_read_audit())
+        app_launch_rows = [r for r in audit_rows if r["action_type"] == "app_launch"]
+        mode_restore_rows = [r for r in audit_rows if r["action_type"] == "mode_restore"]
+        results_by_target = {r["target"]: r["result"] for r in app_launch_rows}
+        assert results_by_target == {"Notepad": "success", "Bogus XYZ": "failed"}
+        assert len(mode_restore_rows) == 1
+        assert mode_restore_rows[0]["result"] == "partial"
+        assert mode_restore_rows[0]["target"] == "coding"  # stem
+    finally:
+        _terminate_spawned(spawned_pids)

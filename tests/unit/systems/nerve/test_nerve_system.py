@@ -35,11 +35,13 @@ from nova.core.config import (
 from nova.core.events import EventBus, SessionEnded, SessionStarted
 from nova.core.exceptions import StorageError
 from nova.core.tiers import TierManager
-from nova.core.types import BriefingState, CapabilityTier
+from nova.core.types import ActionType, BriefingState, CapabilityTier
+from nova.ports.hands import HandsPort
 from nova.systems.brain.models import (
     BriefingAggregate,
     SessionSummary,
 )
+from nova.systems.hands.models import ActionResult
 from nova.systems.nerve.models import CommandOutcome
 from nova.systems.nerve.system import NerveSystem, _should_skip_briefing
 from nova.systems.ritual.models import BriefingViewModel
@@ -222,6 +224,20 @@ def _make_event_bus_mock() -> MagicMock:
     return bus
 
 
+def _make_hands_mock() -> MagicMock:
+    """HandsPort-spec'd MagicMock — restore_mode returns an empty result list.
+
+    Story 3.6 added the ``hands: HandsPort`` constructor parameter. Most
+    tests do not exercise the mode-restore path, so the default mock
+    simply returns an empty list (no apps launched, no apps failed) on
+    every call. Tests that DO exercise mode restore override this via
+    ``hands.restore_mode = AsyncMock(side_effect=...)``.
+    """
+    hands = MagicMock(spec=HandsPort)
+    hands.restore_mode = AsyncMock(return_value=[])
+    return hands
+
+
 def _make_tier_manager_mock(tier: CapabilityTier = CapabilityTier.OFFLINE) -> MagicMock:
     """Build a TierManager-spec'd MagicMock with ``tier`` set to the given value.
 
@@ -246,6 +262,7 @@ def _build_nerve_system(
     event_bus: MagicMock | None = None,
     tier_manager: MagicMock | None = None,
     config: NovaConfig | None = None,
+    hands: MagicMock | None = None,
     clock: Any = None,
 ) -> NerveSystem:
     fixed_clock = (
@@ -258,6 +275,7 @@ def _build_nerve_system(
         event_bus=event_bus if event_bus is not None else _make_event_bus_mock(),
         tier_manager=tier_manager if tier_manager is not None else _make_tier_manager_mock(),
         config=config if config is not None else _config(modes={"coding": _mode("coding")}),
+        hands=hands if hands is not None else _make_hands_mock(),
         clock=fixed_clock,
     )
 
@@ -803,7 +821,11 @@ def _build_session_active_nerve() -> tuple[NerveSystem, MagicMock, MagicMock, Ma
     ("verb", "target"),
     [
         (CommandVerb.MODE, None),
-        (CommandVerb.MODE, "coding"),
+        # MODE/"coding" is intentionally NOT in this list: Story 3.6
+        # replaced its placeholder body with HandsPort delegation, so
+        # the "render_response called once with placeholder" shape no
+        # longer applies. Coverage moves to Block I's dedicated
+        # ``test_mode_switch_*`` tests.
         (CommandVerb.MODE_CREATE, None),
         (CommandVerb.MODE_EDIT, None),
         (CommandVerb.MODE_EDIT, "coding"),
@@ -817,7 +839,7 @@ def _build_session_active_nerve() -> tuple[NerveSystem, MagicMock, MagicMock, Ma
 async def test_route_command_layer_b_routable_returns_continue(
     verb: CommandVerb, target: str | None
 ) -> None:
-    """Every Layer B routable verb (except SHUTDOWN) returns CONTINUE."""
+    """Every Layer B routable verb (except SHUTDOWN, MODE/<target>) returns CONTINUE."""
     nerve, _brain, skin, _event_bus = _build_session_active_nerve()
     cmd = Command(verb=verb, target=target, raw_input="x", is_contextual=False)
     outcome = await nerve.route_command(cmd)
@@ -1890,3 +1912,330 @@ async def test_signal_handler_no_op_when_shutdown_event_is_none() -> None:
     await nerve._signal_handler_callback()
     # No Brain call, no exception, _session_active still False.
     assert brain.end_session.await_count == 0
+
+
+# ===========================================================================
+# Block I — Story 3.6: _handle_mode_switch (HandsPort delegation)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_lookup_is_case_insensitive_and_passes_lowercased_stem_to_hands() -> None:
+    """Story 3.4 contract: Nerve's NovaConfig.modes lookup is case-insensitive.
+
+    Closes /bmad-code-review HIGH (user-reported). The Story 3.4 parser
+    preserves the user's casing in ``command.target`` (line 406:
+    "the lookup against NovaConfig.modes is case-insensitive at
+    Nerve's level"). The kebab-case stem validator in Story 1.6 means
+    config keys are always lowercase, so ``command.target.lower()``
+    is the canonical lookup key. Without this normalization, typing
+    ``mode Coding`` or ``Switch to Coding mode`` (parser →
+    target="Coding") misses the ``"coding"`` config key and
+    incorrectly renders "No mode named 'Coding'".
+
+    This test exercises both shapes:
+    1. The lookup resolves the uppercase ``"Coding"`` to the
+       lowercase ``"coding"`` mode config.
+    2. Hands receives the LOWERCASED canonical stem (not the
+       user's casing) so downstream identity (audit target,
+       ModeRestored event, _active_mode_name) stays canonical.
+    """
+    coding_mode = _mode("coding")
+    hands = _make_hands_mock()
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH,
+                target="x",
+                success=True,
+                reason=None,
+            )
+        ]
+    )
+    nerve = _build_nerve_system(hands=hands, config=_config(modes={"coding": coding_mode}))
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    # User types `mode Coding` — parser preserves casing in target.
+    cmd = Command(
+        verb=CommandVerb.MODE, target="Coding", raw_input="mode Coding", is_contextual=False
+    )
+    outcome = await nerve.route_command(cmd)
+
+    assert outcome is CommandOutcome.CONTINUE
+    # Hands received the LOWERCASED canonical stem AND the resolved mode_config.
+    hands.restore_mode.assert_called_once_with("coding", coding_mode)
+    # Active mode name tracked as canonical (lowercased) stem.
+    assert nerve._active_mode_name == "coding"
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_unknown_target_error_echoes_original_user_casing() -> None:
+    """Unknown-mode error message echoes the user's original casing.
+
+    Closes the user-facing half of the case-insensitivity fix. The
+    LOOKUP is case-insensitive, but if the lookup misses entirely the
+    error template should reflect what the USER typed (not the
+    lowercased internal lookup key) so they recognize the input.
+    """
+    skin = _make_skin_mock()
+    hands = _make_hands_mock()
+    nerve = _build_nerve_system(
+        skin=skin,
+        hands=hands,
+        config=_config(modes={"coding": _mode("coding"), "study": _mode("study")}),
+    )
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    # User types `mode UnknownMode` (capital U + M) — neither casing
+    # nor lowercased version exists in config.modes.
+    cmd = Command(
+        verb=CommandVerb.MODE,
+        target="UnknownMode",
+        raw_input="mode UnknownMode",
+        is_contextual=False,
+    )
+    await nerve.route_command(cmd)
+
+    skin.render_response.assert_called_once_with(
+        "No mode named 'UnknownMode'. Try mode to see available modes."
+    )
+    assert hands.restore_mode.call_count == 0
+    assert nerve._active_mode_name is None
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_unknown_target_renders_friendly_error_and_does_not_call_hands() -> None:
+    """Unknown mode → friendly response, NO Hands call, _active_mode_name stays None."""
+    skin = _make_skin_mock()
+    hands = _make_hands_mock()
+    nerve = _build_nerve_system(
+        skin=skin,
+        hands=hands,
+        config=_config(modes={"coding": _mode("coding"), "study": _mode("study")}),
+    )
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    cmd = Command(
+        verb=CommandVerb.MODE, target="unknown", raw_input="mode unknown", is_contextual=False
+    )
+    outcome = await nerve.route_command(cmd)
+
+    assert outcome is CommandOutcome.CONTINUE
+    skin.render_response.assert_called_once_with(
+        "No mode named 'unknown'. Try mode to see available modes."
+    )
+    assert hands.restore_mode.call_count == 0
+    assert nerve._active_mode_name is None
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_known_target_delegates_to_hands_with_stem_and_mode_config() -> None:
+    """Known mode → hands.restore_mode(mode_stem='coding', mode_config=<config>)."""
+    coding_mode = _mode("coding")
+    skin = _make_skin_mock()
+    hands = _make_hands_mock()
+    nerve = _build_nerve_system(
+        skin=skin, hands=hands, config=_config(modes={"coding": coding_mode})
+    )
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    cmd = Command(
+        verb=CommandVerb.MODE, target="coding", raw_input="mode coding", is_contextual=False
+    )
+    await nerve.route_command(cmd)
+
+    hands.restore_mode.assert_called_once_with("coding", coding_mode)
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_passes_command_target_as_mode_stem() -> None:
+    """The stem comes from command.target — NOT from mode_config.name."""
+    config_with_display_name = ModeConfig(
+        name="Coding Display",  # display label different from the stem
+        apps=(AppConfig(name="x", executable="x.exe"),),
+    )
+    hands = _make_hands_mock()
+    nerve = _build_nerve_system(
+        hands=hands,
+        config=_config(modes={"coding": config_with_display_name}),
+    )
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    cmd = Command(
+        verb=CommandVerb.MODE, target="coding", raw_input="mode coding", is_contextual=False
+    )
+    await nerve.route_command(cmd)
+
+    args, kwargs = hands.restore_mode.call_args
+    assert args[0] == "coding"  # stem from command.target
+    assert args[0] != "Coding Display"  # NOT the display label
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_sets_active_mode_name_to_stem_after_successful_restore() -> None:
+    hands = _make_hands_mock()
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH,
+                target="x",
+                success=True,
+                reason=None,
+            )
+        ]
+    )
+    nerve = _build_nerve_system(hands=hands, config=_config(modes={"coding": _mode("coding")}))
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    await nerve.route_command(cmd)
+
+    assert nerve._active_mode_name == "coding"
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_clears_active_mode_name_on_second_restore_total_failure() -> None:
+    """Second-restore total-failure clears ``_active_mode_name`` (doesn't keep stale).
+
+    Closes /bmad-code-review patch #4 (EC#5). Sequence: ``mode coding``
+    succeeds → ``_active_mode_name="coding"`` → ``mode coding`` again
+    but every app now fails → ``_active_mode_name`` MUST clear to None
+    (otherwise Story 3.7 shutdown and Story 3.9 status both lie about
+    the workspace state right after the user saw "No apps could be
+    launched").
+    """
+    coding_mode = _mode("coding")
+    hands = _make_hands_mock()
+    nerve = _build_nerve_system(hands=hands, config=_config(modes={"coding": coding_mode}))
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    # First restore — succeeds.
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH,
+                target="x",
+                success=True,
+                reason=None,
+            )
+        ]
+    )
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    await nerve.route_command(cmd)
+    assert nerve._active_mode_name == "coding"
+
+    # Second restore — every app fails.
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH,
+                target="x",
+                success=False,
+                reason="not found",
+            )
+        ]
+    )
+    await nerve.route_command(cmd)
+    assert nerve._active_mode_name is None
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_does_not_set_active_mode_name_on_total_failure() -> None:
+    """Total-failure restore (zero apps launched) → ``_active_mode_name`` stays None.
+
+    Closes Blind Hunter finding #13: claiming a mode is "active" when
+    all configured apps failed to launch would lie to Story 3.7's
+    shutdown summary and Story 3.9's status command.
+    """
+    hands = _make_hands_mock()
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH,
+                target="x",
+                success=False,
+                reason="not found",
+            ),
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH,
+                target="y",
+                success=False,
+                reason="not found",
+            ),
+        ]
+    )
+    nerve = _build_nerve_system(hands=hands, config=_config(modes={"coding": _mode("coding")}))
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    await nerve.route_command(cmd)
+
+    assert nerve._active_mode_name is None
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_sets_active_mode_name_even_on_partial_restore() -> None:
+    """Hands returns a partial result list — _active_mode_name still set (partial is active)."""
+    coding_mode = _mode("coding")
+    hands = _make_hands_mock()
+    hands.restore_mode = AsyncMock(
+        return_value=[
+            ActionResult(action_type=ActionType.APP_LAUNCH, target="x", success=True, reason=None),
+            ActionResult(
+                action_type=ActionType.APP_LAUNCH, target="y", success=False, reason="not found"
+            ),
+        ]
+    )
+    nerve = _build_nerve_system(hands=hands, config=_config(modes={"coding": coding_mode}))
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    await nerve.route_command(cmd)
+
+    assert nerve._active_mode_name == "coding"
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_does_not_consult_tier_manager() -> None:
+    """Mode restore is purely-local — must NOT read tier_manager.tier."""
+    from unittest.mock import PropertyMock
+
+    tier_mgr = MagicMock(spec=TierManager)
+    tier_property = PropertyMock(return_value=CapabilityTier.OFFLINE)
+    type(tier_mgr).tier = tier_property
+    nerve = _build_nerve_system(
+        tier_manager=tier_mgr, config=_config(modes={"coding": _mode("coding")})
+    )
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    # Reset the access count after construction (TierManager.tier might be
+    # touched during __init__ in the future; we only care about access
+    # during the handler).
+    tier_property.reset_mock()
+
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    await nerve.route_command(cmd)
+
+    assert tier_property.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mode_switch_returns_continue_outcome() -> None:
+    nerve = _build_nerve_system(config=_config(modes={"coding": _mode("coding")}))
+    nerve._session_id = 42
+    nerve._session_active = True
+
+    cmd = Command(verb=CommandVerb.MODE, target="coding", raw_input="x", is_contextual=False)
+    outcome = await nerve.route_command(cmd)
+
+    assert outcome is CommandOutcome.CONTINUE

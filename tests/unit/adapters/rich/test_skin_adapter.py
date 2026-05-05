@@ -23,8 +23,9 @@ import pytest
 from rich.console import Console
 
 from nova.adapters.rich.skin import RichSkinAdapter
-from nova.core.types import BriefingState, CapabilityTier
+from nova.core.types import ActionType, BriefingState, CapabilityTier
 from nova.systems.brain.models import ModeInfo
+from nova.systems.hands.models import ActionResult
 from nova.systems.ritual.models import BriefingViewModel
 
 # --- Fixture builders --------------------------------------------------------
@@ -870,3 +871,74 @@ async def test_collect_input_safe_set_result_handles_already_done_future() -> No
     _safe_set_result(fut, "value")
     _safe_set_exception(fut, RuntimeError("ignored"))
     assert fut.cancelled()
+
+
+# ===========================================================================
+# Story 3.6 — render_progress (per-app inline launch result)
+# ===========================================================================
+
+
+def _action_result(target: str, *, success: bool, reason: str | None) -> ActionResult:
+    return ActionResult(
+        action_type=ActionType.APP_LAUNCH,
+        target=target,
+        success=success,
+        reason=reason,
+    )
+
+
+@pytest.mark.asyncio
+async def test_render_progress_success_renders_check_mark_plus_target() -> None:
+    console = _build_console()
+    adapter = RichSkinAdapter(console=console)
+    result = _action_result("VS Code", success=True, reason=None)
+
+    await adapter.render_progress(result)
+
+    output = console.export_text()
+    assert "✓ VS Code" in output
+
+
+@pytest.mark.asyncio
+async def test_render_progress_failure_not_found_appends_is_it_installed_hint() -> None:
+    from nova.ports.app_launcher import REASON_NOT_FOUND
+
+    console = _build_console()
+    adapter = RichSkinAdapter(console=console)
+    result = _action_result("Postman", success=False, reason=REASON_NOT_FOUND)
+
+    await adapter.render_progress(result)
+
+    output = console.export_text()
+    assert "✗ Postman (not found — is it installed?)" in output
+
+
+@pytest.mark.asyncio
+async def test_render_progress_failure_other_reason_renders_plain_parens() -> None:
+    from nova.ports.app_launcher import REASON_PERMISSION_DENIED
+
+    console = _build_console()
+    adapter = RichSkinAdapter(console=console)
+    result = _action_result("LockedApp", success=False, reason=REASON_PERMISSION_DENIED)
+
+    await adapter.render_progress(result)
+
+    output = console.export_text()
+    assert "✗ LockedApp (permission denied)" in output
+    # Make sure no extra hint was appended
+    assert "is it installed" not in output
+
+
+@pytest.mark.asyncio
+async def test_render_progress_uses_markup_false() -> None:
+    """Verify markup=False is passed to console.print for security."""
+    from unittest.mock import MagicMock
+
+    mock_console = MagicMock(spec=Console)
+    adapter = RichSkinAdapter(console=mock_console)
+    result = _action_result("X", success=True, reason=None)
+
+    await adapter.render_progress(result)
+
+    mock_console.print.assert_called_once()
+    assert mock_console.print.call_args.kwargs.get("markup") is False

@@ -335,6 +335,58 @@ def test_nerve_system_is_instantiated_inside_create_app() -> None:
     )
 
 
+def test_win32_hands_adapter_is_instantiated_inside_create_app() -> None:
+    """Story 3.6 AC #21 — positive-case AST assertion for ``Win32HandsAdapter``."""
+    _assert_class_instantiated_inside_create_app(
+        "Win32HandsAdapter",
+        "Story 3.6 AC #21 requires Win32HandsAdapter to be wired in the composition root.",
+    )
+
+
+def test_hands_system_is_instantiated_inside_create_app() -> None:
+    """Story 3.6 AC #21 — positive-case AST assertion for ``HandsSystem``."""
+    _assert_class_instantiated_inside_create_app(
+        "HandsSystem",
+        "Story 3.6 AC #21 requires HandsSystem to be wired in the composition root.",
+    )
+
+
+def test_nerve_system_call_passes_hands_kwarg() -> None:
+    """Story 3.6 — ``NerveSystem(...)`` in create_app receives a ``hands=`` kwarg.
+
+    AST-walk the ``create_app`` body for the ``NerveSystem(...)`` call
+    and assert ``hands`` appears as one of the keyword args. Locks the
+    Story 3.6 wiring without re-running the whole composition graph
+    (which would require a real DB + asyncio loop in unit-test scope).
+    """
+    app_path = NOVA_SRC_ROOT / "app.py"
+    tree = ast.parse(app_path.read_text(encoding="utf-8"))
+
+    create_app_fn: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "create_app":
+            create_app_fn = node
+            break
+    assert create_app_fn is not None
+
+    nerve_call: ast.Call | None = None
+    for inner in ast.walk(create_app_fn):
+        if (
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "NerveSystem"
+        ):
+            nerve_call = inner
+            break
+    assert nerve_call is not None, "create_app must instantiate NerveSystem"
+
+    kwarg_names = {kw.arg for kw in nerve_call.keywords if kw.arg is not None}
+    assert "hands" in kwarg_names, (
+        f"NerveSystem(...) call in create_app must include hands= kwarg "
+        f"(Story 3.6 reshape); got kwargs: {sorted(kwarg_names)}."
+    )
+
+
 def _assert_class_instantiated_inside_create_app(class_name: str, requirement: str) -> None:
     """Walk ``create_app``'s AST and assert at least one ``ClassName(...)`` call."""
     app_path = NOVA_SRC_ROOT / "app.py"
@@ -377,6 +429,10 @@ _LOGGER_NAME_DEPTH_ALLOWLIST: frozenset[str] = frozenset(
         # shape (``adapters/{driver}/{system}``) as the SQLite Brain
         # adapter.
         "nova.adapters.rich.skin",
+        # Story 3.6 — Win32 Hands actions adapter follows the same
+        # nested shape (``adapters/{driver}/{system}``) as the SQLite
+        # Brain and Rich Skin adapters.
+        "nova.adapters.win32.actions",
     }
 )
 

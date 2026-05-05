@@ -48,6 +48,7 @@ from rich.console import Console
 from nova.adapters.rich import RichSkinAdapter
 from nova.adapters.shield import NoOpShieldAdapter
 from nova.adapters.sqlite.brain import SqliteBrainAdapter
+from nova.adapters.win32.actions import Win32HandsAdapter
 from nova.core import (
     AuditLogger,
     CapabilityTier,
@@ -57,10 +58,13 @@ from nova.core import (
     TierManager,
 )
 from nova.ports import ShieldPort
+from nova.ports.app_launcher import AppLauncherPort
 from nova.ports.brain import BrainPort
+from nova.ports.hands import HandsPort
 from nova.ports.nerve import NervePort
 from nova.ports.ritual import RitualPort
 from nova.ports.skin import SkinPort
+from nova.systems.hands.system import HandsSystem
 from nova.systems.nerve.system import NerveSystem
 from nova.systems.ritual import RitualSystem
 
@@ -111,6 +115,7 @@ class NovaApp:
     audit: AuditLogger
     tier_manager: TierManager
     shield: ShieldPort
+    hands: HandsPort
     ritual: RitualPort
     skin: SkinPort
     nerve: NervePort
@@ -208,15 +213,31 @@ async def create_app(
             extra={"adapter": type(shield_adapter).__name__},
         )
 
-        # Story 3.3 — Ritual system + Rich skin adapter. Both are stateless
-        # (Ritual is parameterless, RichSkinAdapter holds one Console
-        # reference); neither acquires external resources, so the existing
-        # partial-init cleanup block already covers them.
-        ritual: RitualPort = RitualSystem()
-        logger.info("ritual system wired", extra={"system": type(ritual).__name__})
-
+        # Story 3.3 — Rich skin adapter (moved BEFORE Ritual in Story 3.6
+        # so HandsSystem can receive the skin reference at construction).
+        # Stateless (holds one Console reference); no external resources
+        # acquired — the existing partial-init cleanup already covers it.
         skin: SkinPort = RichSkinAdapter(console=Console())
         logger.info("skin adapter wired", extra={"adapter": type(skin).__name__})
+
+        # Story 3.6 — App launcher adapter + Hands system. Both
+        # constructors are reference-storage only (Win32HandsAdapter
+        # stores a timeout float; HandsSystem stores port refs and the
+        # AuditLogger). Zero new failure modes added to the cleanup path.
+        launcher: AppLauncherPort = Win32HandsAdapter()
+        logger.info("app launcher adapter wired", extra={"adapter": type(launcher).__name__})
+
+        hands: HandsPort = HandsSystem(
+            launcher=launcher,
+            skin=skin,
+            event_bus=event_bus,
+            audit=audit,
+        )
+        logger.info("hands system wired", extra={"system": type(hands).__name__})
+
+        # Story 3.3 — Ritual system. Parameterless, stateless.
+        ritual: RitualPort = RitualSystem()
+        logger.info("ritual system wired", extra={"system": type(ritual).__name__})
 
         # Story 3.5 — Nerve orchestrator. Constructor is reference-storage
         # only (no I/O, no clock reads, no asyncio.Event creation), so it
@@ -230,6 +251,7 @@ async def create_app(
             event_bus=event_bus,
             tier_manager=tier_manager,
             config=config,
+            hands=hands,
         )
         logger.info("nerve system wired", extra={"system": type(nerve).__name__})
 
@@ -245,6 +267,7 @@ async def create_app(
             audit=audit,
             tier_manager=tier_manager,
             shield=shield_adapter,
+            hands=hands,
             ritual=ritual,
             skin=skin,
             nerve=nerve,

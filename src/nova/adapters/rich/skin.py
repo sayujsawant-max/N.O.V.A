@@ -7,8 +7,15 @@ Briefing Card Panel surface). Story 3.4 ships :meth:`parse_command`
 (delegates to :func:`nova.systems.skin.commands.parse`). Story 3.5 ships
 :meth:`collect_input` and :meth:`render_response` (the REPL primitives
 the :class:`~nova.systems.nerve.system.NerveSystem` loop consumes).
-Tree (transparency, Epic 5), Progress (mode restore, Story 3.6), and
-the Shutdown Card (Story 3.7) land in their respective stories.
+Story 3.6 ships :meth:`render_progress` per-app inline (single
+:class:`ActionResult` per call, NOT a batch). Tree (transparency,
+Epic 5) and the Shutdown Card (Story 3.7) land in their respective
+stories.
+
+The :data:`REASON_NOT_FOUND` import from :mod:`nova.ports.app_launcher`
+is the canonical reason-vocabulary owner — importing from the port
+file (not from a sibling adapter) preserves the no-cross-adapter-imports
+rule (project-context.md:62).
 
 Port-trapping invariant (project-context.md §62):
 Rich-specific types (:class:`rich.panel.Panel`, :class:`rich.text.Text`,
@@ -51,7 +58,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Sequence
 from typing import Any
 
 from rich.console import Console
@@ -59,6 +65,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
 
+from nova.ports.app_launcher import REASON_NOT_FOUND
 from nova.systems.brain.models import SessionSummary
 from nova.systems.hands.models import ActionResult
 from nova.systems.ritual.models import BriefingViewModel
@@ -159,8 +166,32 @@ class RichSkinAdapter:
         )
         self._console.print(panel)
 
-    async def render_progress(self, results: Sequence[ActionResult]) -> None:
-        raise NotImplementedError("Story 3.6 scope")
+    async def render_progress(self, result: ActionResult) -> None:
+        """Render a single per-app launch result inline (Story 3.6).
+
+        Line shape:
+        * Success (including the already-running case — adapter
+          returns ``success=True, reason=None`` either way):
+          ``"✓ {result.target}"``.
+        * Failure with ``reason == REASON_NOT_FOUND``:
+          ``"✗ {result.target} (not found — is it installed?)"``
+          (extra ``"is it installed?"`` hint per UX spec line 698).
+        * Other failure: ``"✗ {result.target} ({result.reason})"``.
+
+        Operational output per project-context.md:66 — direct to Skin,
+        no Voice. ``markup=False`` is critical for the same reason as
+        :meth:`render_response`: Rich's default markup parsing would
+        interpret ``[`` / ``]`` in app names or reasons. The
+        :func:`asyncio.to_thread` wrap mirrors :meth:`render_response`
+        / :meth:`render_briefing_card` for Rich's blocking I/O.
+        """
+        if result.success:
+            line = f"✓ {result.target}"
+        elif result.reason == REASON_NOT_FOUND:
+            line = f"✗ {result.target} ({result.reason} — is it installed?)"
+        else:
+            line = f"✗ {result.target} ({result.reason})"
+        await asyncio.to_thread(self._console.print, line, markup=False)
 
     async def render_shutdown_card(self, summary: SessionSummary) -> None:
         raise NotImplementedError("Story 3.7 scope")

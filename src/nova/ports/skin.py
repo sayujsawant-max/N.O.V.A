@@ -11,6 +11,14 @@ consumes already-rendered content (a view model, a summary, a Voice-
 generated string). Voice generates text; Skin renders it. The two roles
 never cross.
 
+Story 3.6 reshapes :meth:`render_progress` from
+``Sequence[ActionResult] -> None`` to ``ActionResult -> None`` so
+:class:`~nova.systems.hands.system.HandsSystem` streams per-app
+feedback inline as each launch lands rather than batching at the end.
+The Sequence form was speculative (Story 1.9 stub); single-result is
+what the epic AC requires (``✓ VS Code`` / ``✗ Postman`` lines render
+as each launch lands).
+
 Port rules (architecture.md:948-986, 1464):
 
 - :class:`SkinPort` is a :class:`typing.Protocol` (structural subtyping).
@@ -23,7 +31,6 @@ Port rules (architecture.md:948-986, 1464):
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Protocol
 
 from nova.systems.brain.models import SessionSummary
@@ -37,7 +44,7 @@ class SkinPort(Protocol):
 
     async def render_briefing_card(self, view_model: BriefingViewModel) -> None: ...
 
-    async def render_progress(self, results: Sequence[ActionResult]) -> None: ...
+    async def render_progress(self, result: ActionResult) -> None: ...
 
     async def render_shutdown_card(self, summary: SessionSummary) -> None: ...
 
