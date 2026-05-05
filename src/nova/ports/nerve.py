@@ -13,17 +13,29 @@ facing prose. Events flow through :class:`nova.core.events.EventBus`
 surface here — subscriptions are wired in the composition root
 (Story 1.10).
 
+Story 3.5 reshape
+-----------------
+:meth:`NervePort.route_command` now returns
+:class:`~nova.systems.nerve.models.CommandOutcome` (was ``None``). Closes
+``deferred-work.md:139`` ("error surface undocumented"). The REPL loop
+inspects the return value with ``if outcome is CommandOutcome.EXIT``
+instead of relying on control-flow-via-exception. Every routed command
+declares its outcome explicitly via the closed two-member vocabulary
+(``CONTINUE`` / ``EXIT``).
+
 Port rules (architecture.md:948-986, 1465):
 
 - :class:`NervePort` is a :class:`typing.Protocol` (structural subtyping).
 - Every method is ``async def`` with an ellipsis body.
-- No adapter types — only :class:`nova.systems.skin.models.Command`.
+- No adapter types — only :class:`nova.systems.skin.models.Command` and
+  :class:`nova.systems.nerve.models.CommandOutcome`.
 """
 
 from __future__ import annotations
 
 from typing import Protocol
 
+from nova.systems.nerve.models import CommandOutcome
 from nova.systems.skin.models import Command
 
 
@@ -32,7 +44,7 @@ class NervePort(Protocol):
 
     async def startup(self) -> None: ...
 
-    async def route_command(self, command: Command) -> None: ...
+    async def route_command(self, command: Command) -> CommandOutcome: ...
 
 
 __all__: list[str] = [

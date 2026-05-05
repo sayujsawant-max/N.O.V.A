@@ -562,10 +562,11 @@ async def test_create_app_does_not_echo_the_api_key_in_any_log_record(
 
 
 async def test_tier_stays_offline_without_recovery_loop(tmp_path: Path) -> None:
-    """Story 2.5 Dev Notes — Story 1.10's ``create_app`` does NOT start
-    ``tier_manager.run_recovery_loop()``; Nerve (Story 3.5) owns that. For
-    the duration of a ``nova`` invocation that boots with no API key, the
-    initial OFFLINE tier must persist.
+    """Story 2.5 Dev Notes — ``create_app`` does NOT start
+    ``tier_manager.run_recovery_loop()``. Story 3.5 explicitly defers the
+    recovery loop to a future story (the Claude adapter is the natural
+    home — see Story 3.5 § Group I). The initial OFFLINE tier must persist
+    for the duration of a ``nova`` invocation that boots with no API key.
 
     This is a behavioral smoke test — if a future refactor starts the
     recovery loop inside ``create_app``, the ``_AlwaysHealthyCheck`` stub

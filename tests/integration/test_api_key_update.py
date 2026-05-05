@@ -51,6 +51,17 @@ def _clean_nova_logging() -> Iterator[None]:
             handler.close()
 
 
+@pytest.fixture(autouse=True)
+def _short_circuit_nerve_repl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Story 3.5 — patch the Skin REPL primitive so api-key tests exit fast.
+
+    These tests verify api-key bootstrap behavior (Story 2.5), not
+    session-loop semantics. Without this fixture, ``app.nerve.startup()``
+    blocks on ``Prompt.ask`` and pytest's stdin-capture raises ``OSError``.
+    """
+    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: "shutdown")
+
+
 def _atomic_write_settings(path: Path, data: dict[str, object]) -> None:
     """Write ``settings.yaml`` via the Story 2.2 atomic-swap pattern
     (``yaml.safe_dump`` + ``os.replace``).

@@ -16,6 +16,7 @@ Skin side: given a ViewModel, what bytes appear on screen.
 
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 
 import pytest
@@ -706,3 +707,166 @@ def test_parse_command_is_async_at_skinport_boundary() -> None:
     import inspect
 
     assert inspect.iscoroutinefunction(RichSkinAdapter.parse_command) is True
+
+
+# --- Story 3.5 — render_response + collect_input adapter tests --------------
+
+
+@pytest.mark.asyncio
+async def test_render_response_prints_to_console() -> None:
+    """``render_response`` calls ``Console.print(text, markup=False)`` exactly once.
+
+    Per AC #17, asserts the underlying ``Console.print`` invocation
+    against a ``MagicMock`` console with the exact ``markup=False``
+    kwarg. A future refactor that adds panel-wrapping, prefix
+    decoration, or markup interpretation would silently pass a
+    string-output assertion but fails this stronger lock.
+    """
+    from unittest.mock import MagicMock
+
+    mock_console = MagicMock(spec=Console)
+    adapter = RichSkinAdapter(console=mock_console)
+    await adapter.render_response("hello")
+    mock_console.print.assert_called_once_with("hello", markup=False)
+
+
+@pytest.mark.asyncio
+async def test_collect_input_delegates_to_rich_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``collect_input`` delegates to :func:`Prompt.ask` with the given prompt.
+
+    Patches ``nova.adapters.rich.skin.Prompt.ask`` (NOT the upstream
+    ``rich.prompt.Prompt`` directly) so the patch is visible to the
+    daemon thread that runs ``Prompt.ask`` (Story 3.5 Fix 2 replaced
+    the ``asyncio.to_thread(Prompt.ask, ...)`` pattern with an explicit
+    ``threading.Thread(daemon=True)`` for process-exit safety; the
+    daemon thread reads ``Prompt.ask`` from the same module namespace,
+    so monkeypatching there is what makes the substitution observable).
+    """
+    captured: dict[str, object] = {}
+
+    def fake_ask(prompt: str, **kwargs: object) -> str:
+        captured["prompt"] = prompt
+        captured["console"] = kwargs.get("console")
+        return "mode coding"
+
+    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", fake_ask)
+    console = _build_console(color_system=None)
+    adapter = RichSkinAdapter(console=console)
+    result = await adapter.collect_input(prompt="> ")
+    assert result == "mode coding"
+    assert captured["prompt"] == "> "
+    assert captured["console"] is console
+
+
+@pytest.mark.asyncio
+async def test_collect_input_propagates_eof_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A closed stdin / Ctrl-D inside ``Prompt.ask`` propagates as ``EOFError``.
+
+    The :class:`~nova.systems.nerve.system.NerveSystem` REPL catches at
+    its own boundary and drives a clean SHUTDOWN; the adapter must NOT
+    swallow.
+    """
+
+    def fake_ask(prompt: str, **kwargs: object) -> str:  # noqa: ARG001
+        raise EOFError
+
+    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", fake_ask)
+    adapter = RichSkinAdapter(console=_build_console(color_system=None))
+    with pytest.raises(EOFError):
+        await adapter.collect_input(prompt="> ")
+
+
+@pytest.mark.asyncio
+async def test_render_response_is_async() -> None:
+    """Companion async-shape lock for the new method (mirrors parse_command pattern)."""
+    import inspect
+
+    assert inspect.iscoroutinefunction(RichSkinAdapter.render_response) is True
+
+
+@pytest.mark.asyncio
+async def test_collect_input_is_async() -> None:
+    """Companion async-shape lock for the new method."""
+    import inspect
+
+    assert inspect.iscoroutinefunction(RichSkinAdapter.collect_input) is True
+
+
+@pytest.mark.asyncio
+async def test_collect_input_uses_daemon_thread_for_process_exit_safety(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Process-exit safety lock — the input thread MUST be a daemon thread.
+
+    The blocking ``Prompt.ask`` runs in a background thread. With a
+    non-daemon thread (the default for :func:`asyncio.to_thread`'s
+    executor), :func:`asyncio.run`'s ``shutdown_default_executor`` call
+    waits for the thread to complete — meaning a signal-driven exit
+    can hang indefinitely while the prompt is still blocked on stdin.
+
+    Daemon threads are killed on process exit; the OS does not wait
+    for them. Story 3.5's REPL race-pattern teardown depends on this:
+    when ``_shutdown_event`` fires, the asyncio cancel of the input
+    future returns immediately, and ``asyncio.run`` returns without
+    waiting on the orphaned ``Prompt.ask`` call.
+    """
+    import threading
+
+    captured_threads: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    def capturing_thread(*args: object, **kwargs: object) -> threading.Thread:
+        # Force the daemon prompt to return immediately so the test
+        # doesn't hang. We're verifying the thread CONSTRUCTION kwargs,
+        # not the prompt mechanics.
+        kwargs["target"] = lambda: None
+        thread = real_thread(*args, **kwargs)  # type: ignore[arg-type]
+        captured_threads.append(thread)
+        return thread
+
+    # Patch threading.Thread INSIDE the adapter module so the daemon=True
+    # kwarg is asserted at construction.
+    monkeypatch.setattr("nova.adapters.rich.skin.threading.Thread", capturing_thread)
+
+    adapter = RichSkinAdapter(console=_build_console(color_system=None))
+    # Drive the call but don't wait for the (now-no-op) thread's future.
+    loop = asyncio.get_running_loop()
+    coro = adapter.collect_input(prompt="> ")
+    task = loop.create_task(coro)
+    # Give the thread a moment to start
+    await asyncio.sleep(0)
+    task.cancel()
+    import contextlib
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert len(captured_threads) == 1
+    spawned = captured_threads[0]
+    assert spawned.daemon is True, (
+        "RichSkinAdapter.collect_input MUST spawn a daemon thread so "
+        "asyncio.run does not wait for it on process exit. A non-daemon "
+        "thread blocked on stdin would hang the signal-driven shutdown "
+        "path documented in Story 3.5 § Detected conflicts."
+    )
+    assert spawned.name == "nova-skin-input"
+
+
+@pytest.mark.asyncio
+async def test_collect_input_safe_set_result_handles_already_done_future() -> None:
+    """The thread's safe-set helpers must tolerate cancelled futures.
+
+    REPL race-pattern teardown cancels the asyncio task; the daemon
+    thread may finish ``Prompt.ask`` afterward and try to set the
+    already-done future. Without the done-check, this raises
+    InvalidStateError.
+    """
+    from nova.adapters.rich.skin import _safe_set_exception, _safe_set_result
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[str] = loop.create_future()
+    fut.cancel()
+    # Should not raise
+    _safe_set_result(fut, "value")
+    _safe_set_exception(fut, RuntimeError("ignored"))
+    assert fut.cancelled()

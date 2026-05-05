@@ -503,6 +503,41 @@ _BRAIN_PORT_REMOVED_METHODS: frozenset[str] = frozenset(
 )
 
 
+def test_nerve_port_route_command_returns_command_outcome() -> None:
+    """Story 3.5 AC #4 — ``NervePort.route_command`` return annotation is ``CommandOutcome``.
+
+    Closes ``deferred-work.md:139`` — the previous ``-> None`` return left
+    the error / continue / exit surface implicit. Story 3.5 reshapes the
+    return to the closed two-member ``CommandOutcome`` vocabulary so the
+    REPL loop can drive its continue/exit decision off the return value.
+
+    Uses :func:`typing.get_type_hints` for runtime type resolution rather
+    than raw :func:`inspect.signature` text-comparison; the latter would
+    return the literal string ``"CommandOutcome"`` under
+    ``from __future__ import annotations``, masking a typo or refactor
+    that re-introduced ``-> None``.
+    """
+    from nova.ports.nerve import NervePort
+    from nova.systems.nerve.models import CommandOutcome
+
+    hints = typing.get_type_hints(NervePort.route_command)
+    assert "return" in hints, (
+        "NervePort.route_command must declare a return annotation; "
+        "found no 'return' key in get_type_hints."
+    )
+    assert hints["return"] is CommandOutcome, (
+        f"NervePort.route_command return annotation must be CommandOutcome "
+        f"(closes deferred-work.md:139); resolved to {hints['return']!r}."
+    )
+    # ``startup`` stays ``-> None`` per AC #2 — assert it explicitly so a
+    # future refactor that flipped both methods together would fail this
+    # guard rather than silently wide-en the port surface.
+    startup_hints = typing.get_type_hints(NervePort.startup)
+    assert startup_hints.get("return") is type(None), (
+        f"NervePort.startup must remain ``-> None``; resolved to {startup_hints.get('return')!r}."
+    )
+
+
 def test_brain_port_does_not_redeclare_removed_methods() -> None:
     """Story 3.1 AC #26 — lock the removal of the three Story 1.9 stub methods.
 

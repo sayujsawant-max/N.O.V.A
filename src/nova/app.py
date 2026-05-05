@@ -58,8 +58,10 @@ from nova.core import (
 )
 from nova.ports import ShieldPort
 from nova.ports.brain import BrainPort
+from nova.ports.nerve import NervePort
 from nova.ports.ritual import RitualPort
 from nova.ports.skin import SkinPort
+from nova.systems.nerve.system import NerveSystem
 from nova.systems.ritual import RitualSystem
 
 logger = logging.getLogger("nova.app")
@@ -75,6 +77,13 @@ class _AlwaysHealthyCheck:
 
     Keeps :class:`TierManager` in :attr:`CapabilityTier.FULL` indefinitely
     because the recovery loop sees no failure signal.
+
+    Story 3.5 does NOT swap this stub or start the recovery loop —
+    swapping requires a real Claude-backed health probe, which lands
+    with the Claude adapter. The stub plus the no-recovery-loop posture
+    together preserve the OFFLINE-tier-when-no-api-key promise locked
+    by Story 2.5's smoke test
+    (``tests/unit/test_app.py::test_tier_stays_offline_without_recovery_loop``).
     """
 
     async def ping(self, *, timeout_seconds: float) -> None:
@@ -104,6 +113,7 @@ class NovaApp:
     shield: ShieldPort
     ritual: RitualPort
     skin: SkinPort
+    nerve: NervePort
     close: Callable[[], Awaitable[None]] = field(repr=False)
 
 
@@ -208,6 +218,21 @@ async def create_app(
         skin: SkinPort = RichSkinAdapter(console=Console())
         logger.info("skin adapter wired", extra={"adapter": type(skin).__name__})
 
+        # Story 3.5 — Nerve orchestrator. Constructor is reference-storage
+        # only (no I/O, no clock reads, no asyncio.Event creation), so it
+        # adds zero new failure modes to the partial-init cleanup path.
+        # The recovery loop is NOT started here — see _AlwaysHealthyCheck
+        # docstring for the deferral rationale.
+        nerve: NervePort = NerveSystem(
+            brain=brain,
+            ritual=ritual,
+            skin=skin,
+            event_bus=event_bus,
+            tier_manager=tier_manager,
+            config=config,
+        )
+        logger.info("nerve system wired", extra={"system": type(nerve).__name__})
+
         async def _close() -> None:
             await storage.close()
             logger.info("storage engine closed")
@@ -222,6 +247,7 @@ async def create_app(
             shield=shield_adapter,
             ritual=ritual,
             skin=skin,
+            nerve=nerve,
             close=_close,
         )
     except BaseException:

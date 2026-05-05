@@ -210,6 +210,11 @@ def _fake_app_with_api_key(api_key: str | None, tmp_path: Path) -> MagicMock:
     app.tier_manager = MagicMock()
     app.tier_manager.tier = CapabilityTier.OFFLINE if api_key is None else CapabilityTier.FULL
     app.close = AsyncMock()
+    # Story 3.5 — cli._async_main now awaits ``app.nerve.startup()`` after
+    # the offline notice fires. The fake nerve must satisfy the await
+    # boundary; the test is verifying notice placement, not REPL semantics.
+    app.nerve = MagicMock()
+    app.nerve.startup = AsyncMock(return_value=None)
     return app
 
 
@@ -242,16 +247,18 @@ async def test_notice_integration_in_async_main_when_api_key_none(
     # Notice appears exactly once on stderr.
     assert captured.err.count(_EXPECTED_NOTICE) == 1
 
-    # Ordering: INFO "N.O.V.A. initialized" landed before the placeholder
-    # INFO record, and the notice was emitted between them.
+    # Ordering: INFO "N.O.V.A. initialized" landed before the
+    # session-loop INFO record, and the notice was emitted between them.
+    # Story 3.5 — replaced the placeholder log with "entering session loop"
+    # at the same Step 7 position; the ordering invariant is unchanged.
     cli_records = [r for r in caplog.records if r.name == "nova.cli"]
     init_idx = next(
         i for i, r in enumerate(cli_records) if "N.O.V.A. initialized" in r.getMessage()
     )
-    placeholder_idx = next(
-        i for i, r in enumerate(cli_records) if "session shell placeholder" in r.getMessage()
+    session_loop_idx = next(
+        i for i, r in enumerate(cli_records) if "entering session loop" in r.getMessage()
     )
-    assert init_idx < placeholder_idx, "INFO log order regressed"
+    assert init_idx < session_loop_idx, "INFO log order regressed"
 
 
 async def test_notice_does_not_fire_when_api_key_is_present(

@@ -456,9 +456,13 @@ async def _async_main(args: argparse.Namespace) -> int:
         # log so a human scanning stderr sees the notice without having to
         # tail nova.log.
         _emit_offline_notice_once(config.api_key)
-        # Step 7: placeholder session boot. Epic 3+ replaces this with
-        # the real session loop.
-        logger.info("session shell placeholder — full session loop arrives in Story 3.5")
+        # Step 7: enter the session loop (Story 3.5). Nerve.startup runs
+        # the eleven-step boot path: prior-state aggregate read → state
+        # determine → State A early-return / B-or-C briefing render →
+        # session create → REPL → cleanup. Returns when the REPL exits
+        # via SHUTDOWN command, signal handler, or EOF/KbdInt.
+        logger.info("entering session loop")
+        await app.nerve.startup()
         return EXIT_OK
     finally:
         # Step 8: teardown always runs if create_app succeeded.

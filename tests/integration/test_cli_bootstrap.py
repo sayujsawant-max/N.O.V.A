@@ -72,6 +72,24 @@ def _clean_nova_logging() -> Iterator[None]:
             handler.close()
 
 
+@pytest.fixture(autouse=True)
+def _short_circuit_nerve_repl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Story 3.5 — patch the Skin REPL primitive so bootstrap tests exit fast.
+
+    Story 1.10's bootstrap tests verify the boot sequence (config load,
+    storage init, exit codes); they don't exercise session-loop
+    semantics — that's :mod:`tests.integration.test_session_loop`'s job.
+    Without this fixture, ``app.nerve.startup()`` blocks on
+    ``Prompt.ask`` and pytest's stdin-capture raises ``OSError``, which
+    the REPL doesn't catch.
+
+    Patching ``Prompt.ask`` to return ``"shutdown"`` makes every test's
+    REPL exit on its first iteration, preserving the bootstrap-only
+    intent of these tests.
+    """
+    monkeypatch.setattr("nova.adapters.rich.skin.Prompt.ask", lambda *a, **kw: "shutdown")
+
+
 def _invoke_nova(
     monkeypatch: pytest.MonkeyPatch,
     data_dir: Path | None,
@@ -105,15 +123,23 @@ def test_cli_boots_and_exits_cleanly(
     assert log_path.exists()
     log_text = log_path.read_text(encoding="utf-8")
     assert "N.O.V.A. initialized" in log_text
-    assert "session shell placeholder" in log_text
+    # Story 3.5 — the placeholder log line is replaced by the session-loop
+    # entry log; the autouse REPL-short-circuit fixture makes the loop
+    # exit on its first iteration via a synthetic SHUTDOWN.
+    assert "entering session loop" in log_text
     assert "Traceback" not in log_text
     assert "[ERROR]" not in log_text
 
     assert (nova_data_dir / "nova.db").exists()
 
     captured = capsys.readouterr()
-    # No stdout — Skin's domain.
-    assert captured.out == ""
+    # Story 3.5 — Skin renders the briefing card + "Session ended." to
+    # stdout when the autouse REPL fixture drives the synthetic SHUTDOWN.
+    # Assert the briefing render fired (anti-regression for "did the
+    # briefing actually render at the end of the boot path?") instead of
+    # the now-stale "no stdout" claim.
+    assert "Session Briefing" in captured.out
+    assert "Session ended." in captured.out
     # No stderr on the happy path — Phase A handler must have been
     # removed before the success INFO lines fired.
     assert captured.err == ""
@@ -308,7 +334,6 @@ def test_cli_keyboard_interrupt_during_session_still_closes_engine(
     subsequent "interrupted by user" log in ``main()`` is not
     re-interrupted — that would escape pytest's boundary.
     """
-    import asyncio
     from collections.abc import Callable
     from typing import cast
 
@@ -340,6 +365,70 @@ def test_cli_keyboard_interrupt_during_session_still_closes_engine(
     # counter further but do not re-trigger the interrupt.
     assert raised_once["fired"]
     assert info_call_count["n"] >= 2
+
+
+def test_cli_keyboard_interrupt_from_nerve_startup_returns_exit_interrupted(
+    nova_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 3.5 contract — nerve.startup raises KeyboardInterrupt → main returns 130.
+
+    The custom signal handler (Story 3.5) suppresses the OS-level
+    KeyboardInterrupt-injection that would otherwise propagate from a
+    Ctrl-C during the REPL. Without nerve.startup re-raising
+    ``KeyboardInterrupt`` after a signal-driven exit, the user's Ctrl-C
+    would silently exit with code 0 while the session was marked
+    interrupted in nova.db. Locks the contract that signal-driven exit
+    surfaces as ``EXIT_INTERRUPTED``.
+
+    This test patches ``app.nerve.startup`` directly (instead of firing
+    a real signal) because: (a) firing real SIGINT in a pytest test
+    affects the entire test runner, (b) the contract under test is
+    "nerve raises → cli catches → 130" which is independent of how
+    nerve decided to raise.
+    """
+    import asyncio
+    from typing import Any
+    from unittest.mock import AsyncMock
+
+    from nova.app import create_app as real_create_app
+
+    async def create_app_with_kbdint_startup(config: Any, *, shield: Any = None) -> object:
+        # Build the real app (so app.close still works correctly), then
+        # patch its nerve.startup to raise KeyboardInterrupt as the
+        # signal-driven exit path does in production.
+        app = await real_create_app(config, shield=shield)
+        # Replace nerve.startup with a coroutine that raises KbdInt.
+        # The real app's storage engine is still open; the finally
+        # block in _async_main will call app.close() correctly.
+        app.nerve.startup = AsyncMock(  # type: ignore[method-assign]
+            side_effect=KeyboardInterrupt("session interrupted by signal")
+        )
+        return app
+
+    monkeypatch.setattr(cli_module, "create_app", create_app_with_kbdint_startup)
+
+    exit_code = _invoke_nova(monkeypatch, nova_data_dir)
+    assert exit_code == EXIT_INTERRUPTED, (
+        f"Story 3.5 contract: nerve.startup raising KeyboardInterrupt MUST "
+        f"map to EXIT_INTERRUPTED ({EXIT_INTERRUPTED}); got {exit_code}"
+    )
+
+    # Verify the engine was actually closed by the finally block — open
+    # a fresh one on the same path. If finally didn't fire, WAL would
+    # still hold the file. (Same probe pattern as the
+    # ``_during_session_still_closes_engine`` test above.)
+    monkeypatch.undo()
+    second = SqliteStorageEngine(nova_data_dir / "nova.db")
+
+    async def roundtrip_after_kbdint() -> None:
+        await second.start()
+        try:
+            row = await second.fetchone("SELECT COUNT(*) AS count FROM schema_version")
+            assert row is not None
+        finally:
+            await second.close()
+
+    asyncio.run(roundtrip_after_kbdint())
 
     # Prove the engine was closed by the finally block — open a fresh
     # one on the same path. If ``app.close()`` didn't run, the WAL

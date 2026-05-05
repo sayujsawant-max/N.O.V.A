@@ -321,6 +321,20 @@ def test_rich_skin_adapter_is_instantiated_inside_create_app() -> None:
     )
 
 
+def test_nerve_system_is_instantiated_inside_create_app() -> None:
+    """Story 3.5 AC #21 — positive-case AST assertion for ``NerveSystem``.
+
+    Locks the wiring against silent regression. Without this, a refactor
+    that removed the ``NerveSystem(...)`` line in :func:`create_app`
+    would only fail at runtime (``cli.py`` calls ``app.nerve.startup()``)
+    rather than in CI.
+    """
+    _assert_class_instantiated_inside_create_app(
+        "NerveSystem",
+        "Story 3.5 AC #21 requires NerveSystem to be wired in the composition root.",
+    )
+
+
 def _assert_class_instantiated_inside_create_app(class_name: str, requirement: str) -> None:
     """Walk ``create_app``'s AST and assert at least one ``ClassName(...)`` call."""
     app_path = NOVA_SRC_ROOT / "app.py"

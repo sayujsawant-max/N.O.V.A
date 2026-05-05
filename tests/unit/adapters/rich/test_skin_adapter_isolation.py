@@ -170,11 +170,14 @@ def test_rich_skin_no_dynamic_forbidden_imports() -> None:
 
 
 def test_rich_skin_only_imports_pinned_rich_submodules() -> None:
-    """Rich is allowed, but only the three submodules this story actually uses.
+    """Rich is allowed, but only the submodules this adapter actually uses.
 
     Forces a deliberate decision when a future story needs
     ``rich.tree`` (Epic 5 transparency) or ``rich.progress`` (Story
     3.6) — the new submodule must be added to this allowlist.
+
+    Story 3.5 added ``rich.prompt`` for the REPL primitive
+    :meth:`RichSkinAdapter.collect_input`.
     """
     tree = ast.parse(_read_module_source())
     rich_modules: set[str] = set()
@@ -191,6 +194,7 @@ def test_rich_skin_only_imports_pinned_rich_submodules() -> None:
         {
             "rich.console",
             "rich.panel",
+            "rich.prompt",  # Story 3.5 — REPL collect_input
             "rich.text",
         }
     )

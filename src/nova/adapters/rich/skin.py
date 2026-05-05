@@ -2,12 +2,13 @@
 
 Architecture (architecture.md:1377):
 ``adapters/rich/skin.py — RichSkinAdapter — Panel, Table, Tree, Progress
-rendering``. Story 3.3 ships only :meth:`render_briefing_card` (the
-Briefing Card Panel surface). Tree (transparency, Epic 5) and Progress
-(mode restore, Story 3.6) land in their epics. Command parsing lands
-here via delegation to :func:`nova.systems.skin.commands.parse`; the
-shutdown / response / input methods (Story 3.7) land in their
-respective stories.
+rendering``. Story 3.3 ships :meth:`render_briefing_card` (the
+Briefing Card Panel surface). Story 3.4 ships :meth:`parse_command`
+(delegates to :func:`nova.systems.skin.commands.parse`). Story 3.5 ships
+:meth:`collect_input` and :meth:`render_response` (the REPL primitives
+the :class:`~nova.systems.nerve.system.NerveSystem` loop consumes).
+Tree (transparency, Epic 5), Progress (mode restore, Story 3.6), and
+the Shutdown Card (Story 3.7) land in their respective stories.
 
 Port-trapping invariant (project-context.md §62):
 Rich-specific types (:class:`rich.panel.Panel`, :class:`rich.text.Text`,
@@ -48,10 +49,14 @@ Block assignments:
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Sequence
+from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.text import Text
 
 from nova.systems.brain.models import SessionSummary
@@ -59,6 +64,26 @@ from nova.systems.hands.models import ActionResult
 from nova.systems.ritual.models import BriefingViewModel
 from nova.systems.skin.commands import parse
 from nova.systems.skin.models import Command
+
+
+def _safe_set_result(future: asyncio.Future[Any], result: Any) -> None:
+    """Set ``future``'s result iff it isn't already done.
+
+    Called from :meth:`asyncio.AbstractEventLoop.call_soon_threadsafe`
+    so it runs on the loop thread where future state is consistent.
+    The done-check guards against the cancelled-but-thread-finishes
+    race (REPL race-pattern teardown cancels the asyncio task; the
+    background daemon thread may still complete its blocking ``input``
+    call afterward).
+    """
+    if not future.done():
+        future.set_result(result)
+
+
+def _safe_set_exception(future: asyncio.Future[Any], exc: BaseException) -> None:
+    """Set ``future``'s exception iff it isn't already done. See :func:`_safe_set_result`."""
+    if not future.done():
+        future.set_exception(exc)
 
 
 class RichSkinAdapter:
@@ -141,10 +166,81 @@ class RichSkinAdapter:
         raise NotImplementedError("Story 3.7 scope")
 
     async def render_response(self, text: str) -> None:
-        raise NotImplementedError("Story 3.7 scope")
+        """Plain-line operational output — no panel, no markup, no Voice (Story 3.5).
+
+        Per project-context.md:66, operational output bypasses Voice and
+        renders direct via Skin. ``markup=False`` is critical: Rich's
+        ``Console.print`` interprets ``[bold]…[/]``-style square-bracket
+        markup by default; passing user-controllable text (or any
+        operational template containing ``[`` / ``]``) without the flag
+        would let arbitrary Rich markup activate — including potentially
+        unintended color / styling effects. Wrapped in
+        :func:`asyncio.to_thread` because Rich's ``Console.print`` is
+        blocking I/O — same pattern as :meth:`render_briefing_card`.
+        """
+        await asyncio.to_thread(self._console.print, text, markup=False)
 
     async def collect_input(self, prompt: str) -> str:
-        raise NotImplementedError("Story 3.7 scope")
+        """Block until the user types a line; return the raw string (Story 3.5).
+
+        Process-exit safety
+        -------------------
+        Runs :func:`Prompt.ask` on a **daemon** :class:`threading.Thread`
+        instead of :func:`asyncio.to_thread` (which uses the loop's
+        default executor — a non-daemon thread pool). On signal-driven
+        exit, the REPL's race pattern cancels its asyncio await of this
+        future, but the underlying blocking ``input()`` call is still
+        sitting in the executor thread waiting for stdin. With a
+        non-daemon thread, :func:`asyncio.run`'s
+        ``shutdown_default_executor`` would block process exit until
+        the user types ENTER (or stdin closes). With a daemon thread
+        the OS kills it on process exit, so ``asyncio.run`` returns
+        cleanly even when the prompt is still blocked. Documented
+        invariant; locked by the
+        ``test_collect_input_uses_daemon_thread_for_process_exit_safety``
+        test in ``tests/unit/adapters/rich/test_skin_adapter.py``.
+
+        Cancellation handling
+        ---------------------
+        If the asyncio await of ``future`` is cancelled, the daemon
+        thread continues to run in the background. When it eventually
+        returns (or the process exits), :func:`_safe_set_result` /
+        :func:`_safe_set_exception` short-circuit on the already-done
+        future — no spurious set-on-cancelled-future error.
+
+        Result handling
+        ---------------
+        The empty-input case is allowed through to the Story 3.4
+        parser (which maps to ``CommandVerb.EMPTY``); no pre-filtering
+        happens here. :class:`EOFError` (closed stdin / Ctrl-D)
+        propagates so the caller (:meth:`NerveSystem._run_repl`) can
+        drive a clean SHUTDOWN. :class:`KeyboardInterrupt` propagates
+        similarly.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+
+        def _read_in_daemon_thread() -> None:
+            try:
+                result = Prompt.ask(prompt, console=self._console)
+            except BaseException as exc:  # noqa: BLE001 — propagate via future
+                # BaseException catch is intentional: KeyboardInterrupt /
+                # EOFError / SystemExit raised by ``Prompt.ask`` (or by
+                # signal interruption of the underlying ``input()`` call)
+                # all need to surface on the asyncio future. Anything we
+                # let escape this thread becomes an "unhandled exception
+                # in thread" warning at process exit.
+                loop.call_soon_threadsafe(_safe_set_exception, future, exc)
+            else:
+                loop.call_soon_threadsafe(_safe_set_result, future, result)
+
+        thread = threading.Thread(
+            target=_read_in_daemon_thread,
+            name="nova-skin-input",
+            daemon=True,
+        )
+        thread.start()
+        return await future
 
     async def parse_command(self, raw_input: str) -> Command:
         return parse(raw_input)
